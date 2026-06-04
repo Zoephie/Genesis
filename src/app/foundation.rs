@@ -1,0 +1,1914 @@
+use super::*;
+
+/// Remove `[index]` segments from a rendered field path so it can be matched
+/// against the index-independent paths in a [`FieldFilter`].
+/// e.g. `"contact points[0]/markers[2]"` → `"contact points/markers"`.
+pub(super) fn strip_node_indices(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut in_bracket = false;
+    for ch in path.chars() {
+        match ch {
+            '[' => in_bracket = true,
+            ']' => in_bracket = false,
+            _ if !in_bracket => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether a tag offers the "Search fields" box. Shader/material tags use the
+/// dedicated grid surface and sound tags have no meaningful block tree, so they
+/// are excluded.
+pub(super) fn supports_field_search(entry: &TagEntry) -> bool {
+    !(is_material_tag(entry)
+        || is_material_shader_tag(entry)
+        || is_shader_tag(entry)
+        || &entry.group_tag.to_be_bytes() == b"snd!")
+}
+
+/// Resolve the field-filter action to apply *this* frame. Returns `Some` only
+/// on the frame the (trimmed, lowercased) query changes, so the collapse is a
+/// one-shot the user can then adjust by hand. Clearing a previously-applied
+/// query yields one `RestoreDefaults` pass that re-expands the editor.
+pub(super) fn compute_pending_field_filter(
+    tag: &TagFile,
+    supports: bool,
+    tag_key: &str,
+    field_search: &HashMap<String, String>,
+    field_search_applied: &mut HashMap<String, String>,
+) -> Option<FieldFilterAction> {
+    if !supports {
+        return None;
+    }
+    let query = field_search
+        .get(tag_key)
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if query.is_empty() {
+        // Re-expand to defaults once, but only if a search was actually active.
+        return field_search_applied
+            .remove(tag_key)
+            .map(|_| FieldFilterAction::RestoreDefaults);
+    }
+    if field_search_applied.get(tag_key).map(String::as_str) == Some(query.as_str()) {
+        // Already applied; leave the user's manual expand/collapse intact.
+        return None;
+    }
+    field_search_applied.insert(tag_key.to_owned(), query.clone());
+    Some(FieldFilterAction::Apply(compute_field_filter(tag, &query)))
+}
+
+/// Build the set of collapsible nodes to open for a "Search fields" query:
+/// every struct / block / array whose (display) name contains `query`, plus
+/// all of their ancestor nodes, plus the ancestors of any matching leaf field.
+/// `query` must already be lowercased and non-empty.
+pub(super) fn compute_field_filter(tag: &TagFile, query: &str) -> FieldFilter {
+    let mut open_paths = std::collections::HashSet::new();
+    collect_open_paths(tag.root(), "", query, &mut open_paths);
+    FieldFilter { open_paths }
+}
+
+/// Returns whether `tag_struct` (or anything beneath it) matched, so the
+/// caller can mark the containing node open.
+fn collect_open_paths(
+    tag_struct: TagStruct<'_>,
+    canon_prefix: &str,
+    query: &str,
+    open_paths: &mut std::collections::HashSet<String>,
+) -> bool {
+    let mut any = false;
+    for field in tag_struct.fields() {
+        let name_matches = clean_field_name(field.name())
+            .to_ascii_lowercase()
+            .contains(query);
+        // Canonical path = raw field names joined by '/', no element indices.
+        let canon = if canon_prefix.is_empty() {
+            field.name().to_owned()
+        } else {
+            format!("{canon_prefix}/{}", field.name())
+        };
+
+        let child_matched = if let Some(nested) = field.as_struct() {
+            collect_open_paths(nested, &canon, query, open_paths)
+        } else if let Some(block) = field.as_block() {
+            block
+                .element(0)
+                .map(|el| collect_open_paths(el, &canon, query, open_paths))
+                .unwrap_or(false)
+        } else if let Some(array) = field.as_array() {
+            array
+                .element(0)
+                .map(|el| collect_open_paths(el, &canon, query, open_paths))
+                .unwrap_or(false)
+        } else {
+            // Leaf field: a name match opens its ancestors but adds no node.
+            false
+        };
+
+        let is_node =
+            field.as_struct().is_some() || field.as_block().is_some() || field.as_array().is_some();
+        if is_node && (name_matches || child_matched) {
+            open_paths.insert(canon);
+        }
+        any |= name_matches || child_matched;
+    }
+    any
+}
+
+pub(super) fn draw_struct_fields(
+    ui: &mut Ui,
+    tag_struct: TagStruct<'_>,
+    names: &TagNameIndex,
+    depth: usize,
+    expert_mode: bool,
+    path_prefix: &str,
+    edit: &mut FieldEditContext<'_>,
+) {
+    let title = if depth == 0 {
+        let cleaned = clean_field_name(tag_struct.name());
+        if clean_field_key(&cleaned) == "model" {
+            cleaned.to_ascii_uppercase()
+        } else {
+            format!("Group {}", cleaned.to_ascii_uppercase())
+        }
+    } else {
+        clean_field_name(tag_struct.name())
+    };
+    let open_override = edit.resolve_open(path_prefix, depth <= 1);
+    draw_foundation_group(
+        ui,
+        title,
+        ("struct", path_prefix, depth),
+        depth,
+        depth <= 1,
+        open_override,
+        |ui| {
+            for field in tag_struct.fields() {
+                draw_field(ui, field, names, depth, expert_mode, path_prefix, edit);
+            }
+        },
+    );
+}
+
+pub(super) fn draw_inherited_object_fields(
+    ui: &mut Ui,
+    tag_struct: TagStruct<'_>,
+    names: &TagNameIndex,
+    expert_mode: bool,
+    edit: &mut FieldEditContext<'_>,
+) {
+    let chain = inherited_struct_chain(tag_struct);
+    if chain.len() <= 1 {
+        draw_struct_fields(ui, tag_struct, names, 0, expert_mode, "", edit);
+        return;
+    }
+
+    for (struct_value, path_prefix) in chain.iter().rev() {
+        let title = clean_field_name(struct_value.name()).to_ascii_uppercase();
+        let open_override = edit.resolve_open(path_prefix, true);
+        draw_foundation_group(
+            ui,
+            title,
+            ("inherited_struct", path_prefix.as_str()),
+            0,
+            true,
+            open_override,
+            |ui| {
+                let parent_field = inherited_parent_field_name(*struct_value);
+                for field in struct_value.fields() {
+                    if parent_field.is_some_and(|name| name == field.name()) {
+                        continue;
+                    }
+                    draw_field(ui, field, names, 0, expert_mode, path_prefix, edit);
+                }
+            },
+        );
+    }
+}
+
+pub(super) fn inherited_struct_chain(tag_struct: TagStruct<'_>) -> Vec<(TagStruct<'_>, String)> {
+    let mut chain = vec![(tag_struct, String::new())];
+    let mut current = tag_struct;
+    let mut path_prefix = String::new();
+    while let Some(parent_field) = inherited_parent_field(current) {
+        let Some(parent_struct) = parent_field.as_struct() else {
+            break;
+        };
+        path_prefix = append_field_path(&path_prefix, parent_field.name());
+        chain.push((parent_struct, path_prefix.clone()));
+        current = parent_struct;
+    }
+    chain
+}
+
+pub(super) fn inherited_parent_field_name(tag_struct: TagStruct<'_>) -> Option<&str> {
+    inherited_parent_field(tag_struct).map(|field| field.name())
+}
+
+pub(super) fn inherited_parent_field(tag_struct: TagStruct<'_>) -> Option<TagField<'_>> {
+    tag_struct
+        .fields()
+        .find(|field| field.as_struct().is_some() && is_inherited_parent_name(field.name()))
+}
+
+pub(super) fn is_inherited_parent_name(name: &str) -> bool {
+    matches!(
+        clean_field_key(name).as_str(),
+        "object"
+            | "unit"
+            | "item"
+            | "device"
+            | "device machine"
+            | "device control"
+            | "device light fixture"
+    )
+}
+
+pub(super) fn draw_field(
+    ui: &mut Ui,
+    field: TagField<'_>,
+    names: &TagNameIndex,
+    depth: usize,
+    expert_mode: bool,
+    path_prefix: &str,
+    edit: &mut FieldEditContext<'_>,
+) {
+    let field_path = append_field_path(path_prefix, field.name());
+    let meta = field_display_meta(field.name());
+    if meta.advanced && !expert_mode {
+        return;
+    }
+    if let Some(function) = field.as_function() {
+        draw_foundation_function_row(ui, &meta, &function, depth, &field_path);
+        return;
+    }
+    if let Some(value) = field.value() {
+        if is_hidden_non_expert_value(&value, expert_mode) {
+            return;
+        }
+        draw_foundation_value_row(
+            ui,
+            field,
+            &meta,
+            field.type_name(),
+            &value,
+            names,
+            depth,
+            &field_path,
+            edit,
+        );
+        return;
+    }
+
+    if let Some(nested) = field.as_struct() {
+        let nested_default_open = depth == 0 || is_priority_section(field.name());
+        let open_override = edit.resolve_open(&field_path, nested_default_open);
+        draw_foundation_group(
+            ui,
+            clean_field_name(field.name()),
+            ("field_struct", &field_path),
+            depth + 1,
+            nested_default_open,
+            open_override,
+            |ui| {
+                draw_struct_fields_inline(
+                    ui,
+                    nested,
+                    names,
+                    depth + 1,
+                    expert_mode,
+                    &field_path,
+                    edit,
+                )
+            },
+        );
+    } else if let Some(block) = field.as_block() {
+        draw_foundation_block(
+            ui,
+            field.name(),
+            block,
+            names,
+            depth,
+            expert_mode,
+            &field_path,
+            edit,
+        );
+    } else if let Some(array) = field.as_array() {
+        draw_foundation_array(
+            ui,
+            field.name(),
+            array,
+            names,
+            depth,
+            expert_mode,
+            &field_path,
+            edit,
+        );
+    } else if let Some(resource) = field.as_resource() {
+        draw_resource(
+            ui,
+            field.name(),
+            resource,
+            names,
+            depth,
+            expert_mode,
+            &field_path,
+            edit,
+        );
+    } else {
+        draw_foundation_text_row(ui, field.name(), "unavailable", field.type_name(), depth);
+    }
+}
+
+pub(super) fn draw_struct_fields_inline(
+    ui: &mut Ui,
+    tag_struct: TagStruct<'_>,
+    names: &TagNameIndex,
+    depth: usize,
+    expert_mode: bool,
+    path_prefix: &str,
+    edit: &mut FieldEditContext<'_>,
+) {
+    for field in tag_struct.fields() {
+        draw_field(ui, field, names, depth, expert_mode, path_prefix, edit);
+    }
+}
+
+pub(super) fn draw_foundation_group(
+    ui: &mut Ui,
+    title: String,
+    id_salt: impl std::hash::Hash,
+    depth: usize,
+    default_open: bool,
+    // `Some(open)` forces the open-state this frame (Search-fields filter);
+    // `None` leaves the node's stored / default state untouched.
+    open_override: Option<bool>,
+    add_contents: impl FnOnce(&mut Ui),
+) {
+    ui.scope(|ui| {
+        ui.add_space(2.0);
+        let mut header = egui::CollapsingHeader::new(
+            RichText::new(title).color(text_dark()).strong().size(12.5),
+        )
+        .id_salt(id_salt)
+        .show_background(true);
+        header = match open_override {
+            // `open` and `default_open` are mutually exclusive in egui.
+            Some(_) => header.open(open_override),
+            None => header.default_open(default_open),
+        };
+        let response = header.show(ui, |ui| {
+            Frame::none()
+                .fill(foundation_group_bg())
+                .stroke(Stroke::new(1.0, foundation_group_edge()))
+                .inner_margin(egui::Margin {
+                    left: 8.0 + depth as f32 * 4.0,
+                    right: 8.0,
+                    top: 6.0,
+                    bottom: 6.0,
+                })
+                .show(ui, add_contents);
+        });
+        if response.fully_open() {
+            ui.add_space(3.0);
+        }
+    });
+}
+
+pub(super) fn draw_foundation_block(
+    ui: &mut Ui,
+    name: &str,
+    block: TagBlock<'_>,
+    names: &TagNameIndex,
+    depth: usize,
+    expert_mode: bool,
+    path_prefix: &str,
+    edit: &mut FieldEditContext<'_>,
+) {
+    let count = block.len();
+    let sel = block_selected_index(ui, edit, path_prefix, count);
+    let selected_label = if count == 0 {
+        "NONE".to_owned()
+    } else {
+        format!(
+            "{sel}. {}",
+            block.element(sel).map(|e| e.name()).unwrap_or("element"),
+        )
+    };
+
+    let block_default_open = depth == 0 || is_priority_section(name);
+    let open_override = edit.resolve_open(path_prefix, block_default_open);
+    // A clipboard is compatible when it came from the same group + block path.
+    let clipboard_len = edit
+        .block_clipboard
+        .filter(|clip| {
+            edit.editable && clip.group_tag == edit.group_tag && clip.block_path == path_prefix
+        })
+        .map(|clip| clip.elements.len());
+    let actions = draw_foundation_block_control(
+        ui,
+        name,
+        &selected_label,
+        sel,
+        count,
+        edit.editable,
+        true, // is a real block — add/delete allowed
+        edit.view_scope,
+        edit.tag_key,
+        path_prefix,
+        depth,
+        block_default_open,
+        open_override,
+        clipboard_len,
+        |i| {
+            block
+                .element(i)
+                .map(|e| format!("{i}. {}", e.name()))
+                .unwrap_or_else(|| format!("{i}."))
+        },
+        |ui| {
+            if count == 0 {
+                ui.label(
+                    RichText::new("NONE / empty block")
+                        .italics()
+                        .color(subtle_dark()),
+                );
+                return;
+            }
+            if let Some(element) = block.element(sel) {
+                let element_path = format!("{path_prefix}[{sel}]");
+                draw_struct_fields_inline(
+                    ui,
+                    element,
+                    names,
+                    depth + 1,
+                    expert_mode,
+                    &element_path,
+                    edit,
+                );
+            }
+        },
+    );
+
+    handle_block_actions(ui, edit, path_prefix, sel, count, &actions);
+
+    // Copy the selected element, or the whole block, onto the clipboard.
+    let copy_indices: Option<Vec<usize>> = if actions.copy {
+        Some(vec![sel])
+    } else if actions.copy_block {
+        Some((0..count).collect())
+    } else {
+        None
+    };
+    if let Some(indices) = copy_indices {
+        let elements: Vec<_> = indices
+            .iter()
+            .filter_map(|&i| block.element_snapshot(i))
+            .collect();
+        if !elements.is_empty() {
+            *edit.block_clip_request = Some(BlockClipboard {
+                group_tag: edit.group_tag,
+                block_path: path_prefix.to_owned(),
+                label: clean_field_name(name),
+                elements,
+            });
+        }
+    }
+
+    // Paste / replace from the clipboard.
+    let clip_elements = edit.block_clipboard.map(|clip| clip.elements.clone());
+    if let Some(elements) = clip_elements {
+        if actions.paste {
+            let at = if count == 0 { 0 } else { sel + 1 };
+            edit.block_ops.push(BlockOp {
+                path: path_prefix.to_owned(),
+                kind: BlockOpKind::Paste {
+                    at,
+                    elements: elements.clone(),
+                },
+            });
+            set_block_selected_index(ui, edit, path_prefix, at);
+        }
+        if actions.replace_element && count > 0 {
+            edit.block_ops.push(BlockOp {
+                path: path_prefix.to_owned(),
+                kind: BlockOpKind::ReplaceElement {
+                    at: sel,
+                    elements: elements.clone(),
+                },
+            });
+            set_block_selected_index(ui, edit, path_prefix, sel);
+        }
+        if actions.replace_block {
+            // Destructive (clears the block) — route through the confirm modal.
+            *edit.block_confirm = Some(BlockConfirm {
+                tag_key: edit.tag_key.to_owned(),
+                path: path_prefix.to_owned(),
+                kind: BlockOpKind::ReplaceBlock { elements },
+                message: format!(
+                    "Replace ALL {count} element(s) in this block with {} clipboard element(s)?",
+                    edit.block_clipboard.map_or(0, |c| c.elements.len())
+                ),
+                confirm_label: "Replace".to_owned(),
+            });
+        }
+    }
+}
+
+/// Translate header button clicks into block selection changes / deferred ops.
+pub(super) fn handle_block_actions(
+    ui: &Ui,
+    edit: &mut FieldEditContext<'_>,
+    path: &str,
+    sel: usize,
+    count: usize,
+    actions: &BlockHeaderActions,
+) {
+    if let Some(new_sel) = actions.new_selection {
+        set_block_selected_index(ui, edit, path, new_sel);
+    }
+    if actions.add {
+        edit.block_ops.push(BlockOp {
+            path: path.to_owned(),
+            kind: BlockOpKind::Add,
+        });
+        // Select the new (appended) element next frame.
+        set_block_selected_index(ui, edit, path, count);
+    }
+    if actions.insert {
+        edit.block_ops.push(BlockOp {
+            path: path.to_owned(),
+            kind: BlockOpKind::Insert(sel),
+        });
+        set_block_selected_index(ui, edit, path, sel);
+    }
+    if actions.duplicate {
+        edit.block_ops.push(BlockOp {
+            path: path.to_owned(),
+            kind: BlockOpKind::Duplicate(sel),
+        });
+        set_block_selected_index(ui, edit, path, sel + 1);
+    }
+    if actions.delete && count > 0 {
+        *edit.block_confirm = Some(BlockConfirm {
+            tag_key: edit.tag_key.to_owned(),
+            path: path.to_owned(),
+            kind: BlockOpKind::Delete(sel),
+            message: format!("Delete element {sel} of {count} from this block?"),
+            confirm_label: "Delete".to_owned(),
+        });
+    }
+    if actions.delete_all && count > 0 {
+        *edit.block_confirm = Some(BlockConfirm {
+            tag_key: edit.tag_key.to_owned(),
+            path: path.to_owned(),
+            kind: BlockOpKind::DeleteAll,
+            message: format!("Delete ALL {count} elements from this block?"),
+            confirm_label: "Delete".to_owned(),
+        });
+    }
+}
+
+pub(super) fn draw_foundation_array(
+    ui: &mut Ui,
+    name: &str,
+    array: blam_tags::TagArray<'_>,
+    names: &TagNameIndex,
+    depth: usize,
+    expert_mode: bool,
+    path_prefix: &str,
+    edit: &mut FieldEditContext<'_>,
+) {
+    let count = array.len();
+    let sel = block_selected_index(ui, edit, path_prefix, count);
+    let selected_label = if count == 0 {
+        "NONE".to_owned()
+    } else {
+        format!(
+            "{sel}. {}",
+            array.element(sel).map(|e| e.name()).unwrap_or("element"),
+        )
+    };
+    let open_override = edit.resolve_open(path_prefix, depth == 0);
+    let actions = draw_foundation_block_control(
+        ui,
+        name,
+        &selected_label,
+        sel,
+        count,
+        edit.editable,
+        false, // arrays are fixed-size — no add/delete
+        edit.view_scope,
+        edit.tag_key,
+        path_prefix,
+        depth,
+        depth == 0,
+        open_override,
+        None, // arrays are fixed-size — no element paste
+        |i| {
+            array
+                .element(i)
+                .map(|e| format!("{i}. {}", e.name()))
+                .unwrap_or_else(|| format!("{i}."))
+        },
+        |ui| {
+            if count == 0 {
+                ui.label(
+                    RichText::new("NONE / empty array")
+                        .italics()
+                        .color(subtle_dark()),
+                );
+                return;
+            }
+            if let Some(element) = array.element(sel) {
+                let element_path = format!("{path_prefix}[{sel}]");
+                draw_struct_fields_inline(
+                    ui,
+                    element,
+                    names,
+                    depth + 1,
+                    expert_mode,
+                    &element_path,
+                    edit,
+                );
+            }
+        },
+    );
+    // Arrays only support selection changes (no structural edits).
+    if let Some(new_sel) = actions.new_selection {
+        set_block_selected_index(ui, edit, path_prefix, new_sel);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_foundation_block_control(
+    ui: &mut Ui,
+    name: &str,
+    selected_label: &str,
+    selected_index: usize,
+    count: usize,
+    editable: bool,
+    allow_structural: bool,
+    view_scope: &str,
+    tag_key: &str,
+    path_salt: &str,
+    depth: usize,
+    default_open: bool,
+    // `Some(open)` forces the open-state this frame (Search-fields filter).
+    open_override: Option<bool>,
+    // `Some(n)` when a compatible clipboard holds `n` element(s) (enables the
+    // paste / replace menu items); `None` disables them.
+    clipboard_len: Option<usize>,
+    element_label: impl Fn(usize) -> String,
+    add_contents: impl FnOnce(&mut Ui),
+) -> BlockHeaderActions {
+    let mut actions = BlockHeaderActions::default();
+    let id = ui.make_persistent_id((
+        "foundation_block_control",
+        view_scope,
+        tag_key,
+        path_salt,
+        depth,
+        name,
+    ));
+    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+        ui.ctx(),
+        id,
+        default_open && count > 0,
+    );
+    // Search-fields filter: force this block open/closed for the apply frame.
+    // An empty block can never be opened.
+    if let Some(open) = open_override {
+        state.set_open(open && count > 0);
+    }
+    if count == 0 && state.is_open() {
+        state.set_open(false);
+    }
+
+    let row_width = ui.available_width();
+    let row_height = 26.0;
+    let (row_rect, _) = ui.allocate_exact_size(Vec2::new(row_width, row_height), Sense::hover());
+    ui.painter()
+        .rect_filled(row_rect, 0.0, foundation_block_bar());
+
+    // At-capacity / empty gating mirrors Guerilla's enable rules.
+    let can_edit = editable && allow_structural;
+    let has_sel = count > 0;
+
+    ui.allocate_new_ui(
+        egui::UiBuilder::new().max_rect(row_rect.shrink2(Vec2::new(4.0, 3.0))),
+        |ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
+            ui.horizontal_centered(|ui| {
+                ui.add_space(depth as f32 * 5.0);
+                let toggle = foundation_header_toggle_cell(ui, state.is_open(), count > 0);
+                if toggle.clicked() && count > 0 {
+                    state.toggle(ui);
+                }
+                let name_label = ui.add_sized(
+                    [190.0, 20.0],
+                    egui::Label::new(
+                        RichText::new(clean_field_name(name))
+                            .color(foundation_block_text())
+                            .strong(),
+                    )
+                    .sense(Sense::click()),
+                );
+                // Right-click the block name → copy/paste menu.
+                if allow_structural {
+                    name_label
+                        .on_hover_text("Right-click to copy / paste")
+                        .context_menu(|ui| {
+                            if ui
+                                .add_enabled(count > 0, egui::Button::new("Copy element"))
+                                .clicked()
+                            {
+                                actions.copy = true;
+                                ui.close_menu();
+                            }
+                            if ui
+                                .add_enabled(count > 0, egui::Button::new("Copy entire block"))
+                                .clicked()
+                            {
+                                actions.copy_block = true;
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            match clipboard_len {
+                                Some(n) => {
+                                    let noun = if n == 1 { "element" } else { "elements" };
+                                    if ui.button(format!("Paste {n} {noun}")).clicked() {
+                                        actions.paste = true;
+                                        ui.close_menu();
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            count > 0,
+                                            egui::Button::new("Replace selected element"),
+                                        )
+                                        .clicked()
+                                    {
+                                        actions.replace_element = true;
+                                        ui.close_menu();
+                                    }
+                                    if ui.button("Replace entire block").clicked() {
+                                        actions.replace_block = true;
+                                        ui.close_menu();
+                                    }
+                                }
+                                None => {
+                                    ui.add_enabled(false, egui::Button::new("Paste"));
+                                }
+                            }
+                        });
+                }
+                foundation_header_icon_cell(ui, "[]");
+
+                // Instance selector dropdown — built lazily (only when open).
+                let combo_width = foundation_selected_width(row_width);
+                if has_sel {
+                    egui::ComboBox::from_id_salt((
+                        "block_instance",
+                        view_scope,
+                        tag_key,
+                        path_salt,
+                        depth,
+                    ))
+                    .selected_text(truncate_for_cell(selected_label, combo_width - 24.0))
+                    .width(combo_width)
+                    .show_ui(ui, |ui| {
+                        // Cap the rendered list for very large blocks.
+                        let cap = count.min(2000);
+                        for i in 0..cap {
+                            if ui
+                                .selectable_label(i == selected_index, element_label(i))
+                                .clicked()
+                            {
+                                actions.new_selection = Some(i);
+                            }
+                        }
+                        if cap < count {
+                            ui.label(
+                                RichText::new(format!("… {} more", count - cap))
+                                    .small()
+                                    .color(subtle_dark()),
+                            );
+                        }
+                    });
+                } else {
+                    foundation_header_value_cell(ui, "NONE", combo_width);
+                }
+
+                // Prev / next steppers.
+                if foundation_header_button_clicked(ui, "<", has_sel && selected_index > 0) {
+                    actions.new_selection = Some(selected_index.saturating_sub(1));
+                }
+                if foundation_header_button_clicked(ui, ">", has_sel && selected_index + 1 < count)
+                {
+                    actions.new_selection = Some(selected_index + 1);
+                }
+
+                // Index readout.
+                ui.label(
+                    RichText::new(if has_sel {
+                        format!("[{selected_index}]")
+                    } else {
+                        "[--]".to_owned()
+                    })
+                    .color(foundation_block_text())
+                    .small(),
+                );
+
+                // Structural edit buttons.
+                if foundation_header_button_clicked(ui, "Add", can_edit) {
+                    actions.add = true;
+                }
+                if foundation_header_button_clicked(ui, "Insert", can_edit && has_sel) {
+                    actions.insert = true;
+                }
+                if foundation_header_button_clicked(ui, "Duplicate", can_edit && has_sel) {
+                    actions.duplicate = true;
+                }
+                if foundation_header_button_clicked(ui, "Delete", can_edit && has_sel) {
+                    actions.delete = true;
+                }
+                if foundation_header_button_clicked(ui, "Delete all", can_edit && has_sel) {
+                    actions.delete_all = true;
+                }
+            });
+        },
+    );
+
+    state.store(ui.ctx());
+
+    if count == 0 {
+        return actions;
+    }
+
+    state.show_body_unindented(ui, |ui| {
+        Frame::none()
+            .fill(foundation_group_bg())
+            .stroke(Stroke::new(1.0, foundation_group_edge()))
+            .inner_margin(egui::Margin {
+                left: 14.0 + depth as f32 * 5.0,
+                right: 8.0,
+                top: 8.0,
+                bottom: 8.0,
+            })
+            .show(ui, add_contents);
+    });
+
+    actions
+}
+
+pub(super) fn foundation_header_toggle_cell(
+    ui: &mut Ui,
+    open: bool,
+    enabled: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(22.0, 20.0), Sense::click());
+    let fill = if enabled {
+        foundation_input()
+    } else {
+        Color32::from_rgb(222, 222, 220)
+    };
+    ui.painter().rect_filled(rect, 1.0, fill);
+    ui.painter()
+        .rect_stroke(rect, 1.0, Stroke::new(1.0, foundation_input_edge()));
+    let glyph = if open { "-" } else { "+" };
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        glyph,
+        FontId::proportional(18.0),
+        if enabled { text_dark() } else { subtle_dark() },
+    );
+    response
+}
+
+pub(super) fn foundation_selected_width(row_width: f32) -> f32 {
+    (row_width - 190.0 - 22.0 * 4.0 - 54.0 * 5.0 - 92.0).clamp(120.0, 420.0)
+}
+
+pub(super) fn foundation_header_icon_cell(ui: &mut Ui, text: &str) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(22.0, 20.0), Sense::hover());
+    ui.painter().rect_filled(rect, 1.0, foundation_input());
+    ui.painter()
+        .rect_stroke(rect, 1.0, Stroke::new(1.0, foundation_input_edge()));
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        text,
+        FontId::proportional(11.0),
+        subtle_dark(),
+    );
+}
+
+pub(super) fn foundation_header_value_cell(ui: &mut Ui, text: &str, max_width: f32) {
+    let width = ui.available_width().min(max_width).max(180.0);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 20.0), Sense::hover());
+    ui.painter().rect_filled(rect, 0.0, foundation_input());
+    ui.painter()
+        .rect_stroke(rect, 0.0, Stroke::new(1.0, foundation_input_edge()));
+    ui.painter().text(
+        rect.left_center() + Vec2::new(5.0, 0.0),
+        Align2::LEFT_CENTER,
+        truncate_for_cell(text, width - 10.0),
+        FontId::proportional(12.0),
+        text_dark(),
+    );
+    if response.hovered() {
+        response.on_hover_text(text);
+    }
+}
+
+/// Interactive variant that reports whether the button was clicked.
+pub(super) fn foundation_header_button_clicked(ui: &mut Ui, label: &str, enabled: bool) -> bool {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(RichText::new(label).color(text_dark())).min_size(Vec2::new(54.0, 20.0)),
+    )
+    .clicked()
+}
+
+// ── Block element selection (persisted in egui memory, keyed by block path) ──
+
+pub(super) fn block_selected_index(
+    ui: &Ui,
+    edit: &FieldEditContext<'_>,
+    path: &str,
+    count: usize,
+) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let id = edit.widget_id(("block_sel", path));
+    let raw = ui.data(|d| d.get_temp::<usize>(id)).unwrap_or(0);
+    raw.min(count - 1)
+}
+
+pub(super) fn set_block_selected_index(
+    ui: &Ui,
+    edit: &FieldEditContext<'_>,
+    path: &str,
+    idx: usize,
+) {
+    let id = edit.widget_id(("block_sel", path));
+    ui.data_mut(|d| d.insert_temp(id, idx));
+}
+
+pub(super) fn draw_foundation_bar(
+    ui: &mut Ui,
+    title: String,
+    depth: usize,
+    default_open: bool,
+    add_contents: impl FnOnce(&mut Ui),
+) {
+    ui.scope(|ui| {
+        ui.visuals_mut().widgets.inactive.bg_fill = foundation_section_bar();
+        ui.visuals_mut().widgets.hovered.bg_fill = Color32::from_rgb(205, 205, 201);
+        ui.visuals_mut().widgets.active.bg_fill = Color32::from_rgb(196, 196, 192);
+        let response =
+            egui::CollapsingHeader::new(RichText::new(title).color(text_dark()).strong())
+                .default_open(default_open)
+                .show_background(true)
+                .show(ui, |ui| {
+                    Frame::none()
+                        .fill(foundation_group_bg())
+                        .inner_margin(egui::Margin {
+                            left: 8.0 + depth as f32 * 6.0,
+                            right: 6.0,
+                            top: 5.0,
+                            bottom: 5.0,
+                        })
+                        .show(ui, add_contents);
+                });
+        if response.fully_open() {
+            ui.add_space(2.0);
+        }
+    });
+}
+
+pub(super) fn draw_foundation_value_row(
+    ui: &mut Ui,
+    field: TagField<'_>,
+    meta: &FieldDisplayMeta,
+    type_name: &str,
+    value: &TagFieldData,
+    names: &TagNameIndex,
+    depth: usize,
+    path: &str,
+    edit: &mut FieldEditContext<'_>,
+) {
+    if let TagFieldData::TagReference(reference) = value {
+        let formatted = format_foundation_scalar_value(names, value);
+        // The on-disk tag-ref path is null-terminated; strip the trailing NUL
+        // so it resolves on disk (and tool-import paths are clean).
+        let target = reference
+            .group_tag_and_name
+            .as_ref()
+            .map(|(g, p)| (*g, sanitize_ref_path(p)))
+            .filter(|(_, p)| !p.is_empty());
+        let import_verb = target
+            .as_ref()
+            .and_then(|(group, _)| geometry_import_verb(names, *group));
+        draw_foundation_tag_reference_row(
+            ui,
+            meta,
+            &formatted,
+            target,
+            import_verb,
+            depth,
+            path,
+            edit,
+        );
+        return;
+    }
+
+    if let Some((raw, flag_names)) = flag_value_parts(value) {
+        draw_foundation_flags_row(ui, meta, raw, &flag_names, field, depth, path, edit);
+        return;
+    }
+
+    if let Some(blam_tags::TagOptions::Enum {
+        names: options,
+        current,
+    }) = field.options()
+    {
+        draw_foundation_enum_row(ui, meta, &options, current, depth, path, edit);
+        return;
+    }
+
+    if matches!(
+        value,
+        TagFieldData::RealRgbColor(_) | TagFieldData::RealArgbColor(_)
+    ) {
+        draw_foundation_color_row(ui, meta, value, depth, path, edit);
+        return;
+    }
+
+    if let Some(parts) = foundation_value_parts(value) {
+        draw_foundation_multi_value_row(
+            ui,
+            meta,
+            &parts,
+            field_suffix(meta, type_name).as_str(),
+            depth,
+        );
+        return;
+    }
+
+    let formatted = format_foundation_scalar_value(names, value);
+    if edit.editable && !meta.read_only && is_text_editable_value(value) {
+        draw_foundation_editable_text_row(
+            ui,
+            meta,
+            &formatted,
+            field_suffix(meta, type_name).as_str(),
+            depth,
+            path,
+            edit,
+        );
+        return;
+    }
+    draw_foundation_meta_text_row(
+        ui,
+        meta,
+        &formatted,
+        field_suffix(meta, type_name).as_str(),
+        depth,
+    );
+}
+
+/// A color value row (`real_rgb_color` / `real_argb_color`): channel readouts
+/// plus a clickable swatch that opens the color picker. Used e.g. for a
+/// permutation's `color lower bound` / `color upper bound`.
+pub(super) fn draw_foundation_color_row(
+    ui: &mut Ui,
+    meta: &FieldDisplayMeta,
+    value: &TagFieldData,
+    depth: usize,
+    path: &str,
+    edit: &mut FieldEditContext<'_>,
+) {
+    // (alpha, red, green, blue, is_argb). RGB rows pin alpha to 1.0.
+    let (a, r, g, b, argb) = match value {
+        TagFieldData::RealRgbColor(c) => (1.0, c.red, c.green, c.blue, false),
+        TagFieldData::RealArgbColor(c) => (c.alpha, c.red, c.green, c.blue, true),
+        _ => return,
+    };
+    let channels: &[(&str, f32)] = if argb {
+        &[("a", a), ("r", r), ("g", g), ("b", b)]
+    } else {
+        &[("r", r), ("g", g), ("b", b)]
+    };
+    let swatch = Color32::from_rgb(
+        float_channel_to_u8(r),
+        float_channel_to_u8(g),
+        float_channel_to_u8(b),
+    );
+    let editable = edit.editable && !meta.read_only;
+
+    ui.horizontal(|ui| {
+        ui.add_space(depth as f32 * 12.0);
+        foundation_label_cell(ui, &meta.label);
+        for (label, channel) in channels {
+            ui.label(RichText::new(*label).color(subtle_dark()).small());
+            foundation_input_cell(ui, &format_pc_float(*channel), 76.0);
+        }
+
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
+        ui.painter().rect_filled(rect, 2.0, swatch);
+        ui.painter()
+            .rect_stroke(rect, 2.0, Stroke::new(1.0, foundation_input_edge()));
+        let response = response
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(if editable {
+                "Click to edit color"
+            } else {
+                "Click to inspect color"
+            });
+        if response.clicked() {
+            let mut popup = MaterialColorPopup::new(&meta.label, r, g, b, a);
+            if editable {
+                popup = popup.with_color_field(edit.tag_key, path, argb);
+            }
+            *edit.color_request = Some(popup);
+        }
+        draw_field_help(ui, meta);
+    });
+}
+
+pub(super) fn draw_foundation_multi_value_row(
+    ui: &mut Ui,
+    meta: &FieldDisplayMeta,
+    parts: &[(String, String)],
+    suffix: &str,
+    depth: usize,
+) {
+    ui.horizontal(|ui| {
+        ui.add_space(depth as f32 * 12.0);
+        foundation_label_cell(ui, &meta.label);
+        for (label, value) in parts {
+            if !label.is_empty() {
+                ui.label(RichText::new(label).color(subtle_dark()).small());
+            }
+            foundation_input_cell(ui, value, 92.0);
+        }
+        if !suffix.is_empty() {
+            ui.label(RichText::new(suffix).color(subtle_dark()).small());
+        }
+        draw_field_help(ui, meta);
+    });
+}
+
+pub(super) fn draw_foundation_text_row(
+    ui: &mut Ui,
+    name: &str,
+    value: &str,
+    suffix: &str,
+    depth: usize,
+) {
+    let meta = field_display_meta(name);
+    draw_foundation_meta_text_row(ui, &meta, value, suffix, depth);
+}
+
+pub(super) fn draw_foundation_meta_text_row(
+    ui: &mut Ui,
+    meta: &FieldDisplayMeta,
+    value: &str,
+    suffix: &str,
+    depth: usize,
+) {
+    let indent = depth as f32 * 12.0;
+    let suffix_reserve = if suffix.is_empty() { 0.0 } else { 96.0 };
+    let available_value_width =
+        (ui.available_width() - indent - FOUNDATION_LABEL_WIDTH - suffix_reserve - 28.0)
+            .clamp(180.0, 920.0);
+    ui.horizontal(|ui| {
+        ui.add_space(indent);
+        foundation_label_cell(ui, &meta.label);
+        foundation_input_cell(
+            ui,
+            value,
+            foundation_value_width(value, available_value_width),
+        );
+        if !suffix.is_empty() {
+            ui.label(RichText::new(suffix).color(subtle_dark()).small());
+        }
+        draw_field_help(ui, meta);
+    });
+}
+
+pub(super) fn draw_foundation_editable_text_row(
+    ui: &mut Ui,
+    meta: &FieldDisplayMeta,
+    value: &str,
+    suffix: &str,
+    depth: usize,
+    path: &str,
+    edit: &mut FieldEditContext<'_>,
+) {
+    let indent = depth as f32 * 12.0;
+    let suffix_reserve = if suffix.is_empty() { 0.0 } else { 96.0 };
+    let available_value_width =
+        (ui.available_width() - indent - FOUNDATION_LABEL_WIDTH - suffix_reserve - 28.0)
+            .clamp(180.0, 920.0);
+    let buffer_key = format!("{}|{}", edit.tag_key, path);
+    let id = edit.widget_id(("text", &buffer_key));
+    let buffer = edit
+        .buffers
+        .entry(buffer_key.clone())
+        .or_insert_with(|| value.to_owned());
+    if !ui.memory(|memory| memory.has_focus(id)) && buffer != value {
+        *buffer = value.to_owned();
+    }
+
+    ui.horizontal(|ui| {
+        ui.add_space(indent);
+        foundation_label_cell(ui, &meta.label);
+        let width = foundation_value_width(buffer, available_value_width);
+        let response = foundation_text_edit_cell(ui, buffer, width, id);
+        let commit = response.lost_focus() && buffer.trim() != value.trim();
+        if commit {
+            edit.pending.push(PendingFieldEdit {
+                path: path.to_owned(),
+                input: buffer.trim().to_owned(),
+            });
+        }
+        if !suffix.is_empty() {
+            ui.label(RichText::new(suffix).color(subtle_dark()).small());
+        }
+        draw_field_help(ui, meta);
+    });
+}
+
+pub(super) fn draw_foundation_tag_reference_row(
+    ui: &mut Ui,
+    meta: &FieldDisplayMeta,
+    value: &str,
+    target: Option<(u32, String)>,
+    // `Some(verb)` for references to a geometry tag (render/collision/physics
+    // model or animation graph): shows an Import button that runs `tool <verb>`.
+    import_verb: Option<&'static str>,
+    depth: usize,
+    path: &str,
+    edit: &mut FieldEditContext<'_>,
+) {
+    let suffix = "tag reference";
+    let indent = depth as f32 * 12.0;
+    let available_value_width =
+        (ui.available_width() - indent - FOUNDATION_LABEL_WIDTH - 260.0).clamp(220.0, 760.0);
+    let buffer_key = format!("{}|{}", edit.tag_key, path);
+    let id = edit.widget_id(("tag_ref", &buffer_key));
+    let buffer = edit
+        .buffers
+        .entry(buffer_key.clone())
+        .or_insert_with(|| value.to_owned());
+    if !ui.memory(|memory| memory.has_focus(id)) && buffer != value {
+        *buffer = value.to_owned();
+    }
+
+    ui.horizontal(|ui| {
+        ui.add_space(indent);
+        foundation_label_cell(ui, &meta.label);
+        let editable = edit.editable && !meta.read_only;
+        if editable {
+            let response = foundation_text_edit_cell(
+                ui,
+                buffer,
+                foundation_value_width(buffer, available_value_width),
+                id,
+            );
+            if response.lost_focus() && buffer.trim() != value.trim() {
+                edit.pending.push(PendingFieldEdit {
+                    path: path.to_owned(),
+                    input: buffer.trim().to_owned(),
+                });
+            }
+        } else {
+            foundation_input_cell(
+                ui,
+                value,
+                foundation_value_width(value, available_value_width),
+            );
+        }
+        let browse_clicked =
+            foundation_header_button_clicked(ui, "...", editable && edit.tags_root.is_some());
+        // Open: load the referenced tag in a new tab (resolved against the
+        // loose-folder tags root). Enabled only when the ref is non-empty.
+        if foundation_header_button_clicked(ui, "Open", target.is_some()) {
+            if let Some((group_tag, rel_path)) = target.clone() {
+                *edit.open_request = Some(OpenTagRequest {
+                    group_tag,
+                    rel_path,
+                });
+            }
+        }
+        // Import: only for geometry references (render/collision/physics model,
+        // animation graph). Runs the matching `tool` command in the background.
+        if let (Some(verb), Some((_, rel_path))) = (import_verb, target.as_ref()) {
+            if foundation_header_button_clicked(ui, "Import", edit.tags_root.is_some()) {
+                *edit.tool_import = Some(ToolImportRequest {
+                    verb,
+                    source_dir: model_source_dir(rel_path),
+                });
+            }
+        }
+        if browse_clicked {
+            if let Some(tags_root) = edit.tags_root {
+                let start_ref = target.as_ref().map(|(_, rel_path)| rel_path.as_str());
+                if let Some(input) = choose_tag_reference_input(tags_root, start_ref) {
+                    *buffer = input.clone();
+                    edit.pending.push(PendingFieldEdit {
+                        path: path.to_owned(),
+                        input,
+                    });
+                }
+            }
+        }
+        if ui
+            .add_enabled(
+                editable,
+                egui::Button::new(RichText::new("Clear").color(text_dark()))
+                    .min_size(Vec2::new(54.0, 20.0)),
+            )
+            .clicked()
+        {
+            *buffer = "NONE".to_owned();
+            edit.pending.push(PendingFieldEdit {
+                path: path.to_owned(),
+                input: "NONE".to_owned(),
+            });
+        }
+        ui.label(RichText::new(suffix).color(subtle_dark()).small());
+        draw_field_help(ui, meta);
+    });
+}
+
+/// Strip the trailing NUL terminator (and surrounding whitespace) from an
+/// on-disk tag-reference path so it resolves as a real file path.
+pub(super) fn sanitize_ref_path(path: &str) -> String {
+    path.replace('\u{0}', "").trim().to_owned()
+}
+
+/// The `tool` verb to (re)import the geometry tag a reference points at, or
+/// `None` for any other group. Matched on the resolved group name so it's
+/// independent of fourcc byte order.
+pub(super) fn geometry_import_verb(names: &TagNameIndex, group_tag: u32) -> Option<&'static str> {
+    // Prefer the loaded name index, but fall back to the library's built-in
+    // group→extension table so the button still appears if definitions failed
+    // to load for this source.
+    let group_name = names
+        .name_for(group_tag)
+        .or_else(|| blam_tags::paths::group_tag_to_extension(group_tag))?;
+    match group_name {
+        "render_model" => Some("render"),
+        "collision_model" => Some("collision"),
+        "physics_model" => Some("physics"),
+        "model_animation_graph" => Some("model-animations-uncompressed"),
+        _ => None,
+    }
+}
+
+/// The `tool` source directory for a geometry tag reference: the parent of the
+/// tag path. e.g. `objects\characters\masterchief\masterchief` →
+/// `objects\characters\masterchief` (the dir `tool render` expects).
+pub(super) fn model_source_dir(rel_path: &str) -> String {
+    rel_path
+        .rsplit_once('\\')
+        .map(|(parent, _)| parent.to_owned())
+        .unwrap_or_else(|| rel_path.to_owned())
+}
+
+pub(super) fn tag_reference_start_dir(tags_root: &Path, rel_path: &str) -> PathBuf {
+    let cleaned = sanitize_ref_path(rel_path).replace('/', "\\");
+    if cleaned.is_empty() || cleaned.eq_ignore_ascii_case("NONE") {
+        return tags_root.to_path_buf();
+    }
+
+    let candidate = tags_root.join(PathBuf::from(cleaned));
+    candidate
+        .parent()
+        .filter(|parent| parent.is_dir())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| tags_root.to_path_buf())
+}
+
+pub(super) fn choose_tag_reference_input(
+    tags_root: &Path,
+    start_ref: Option<&str>,
+) -> Option<String> {
+    let start_dir = start_ref
+        .map(|rel_path| tag_reference_start_dir(tags_root, rel_path))
+        .unwrap_or_else(|| tags_root.to_path_buf());
+    let picked = rfd::FileDialog::new()
+        .set_title("Select Tag Reference")
+        .set_directory(start_dir)
+        .pick_file()?;
+    let rel = picked.strip_prefix(tags_root).ok()?;
+    let extension = rel.extension().and_then(|ext| ext.to_str())?;
+    extension_to_group_tag(extension)?;
+    Some(rel.to_string_lossy().replace('/', "\\"))
+}
+
+pub(super) fn draw_foundation_flags_row(
+    ui: &mut Ui,
+    meta: &FieldDisplayMeta,
+    raw: u64,
+    flag_names: &[(u32, String)],
+    field: TagField<'_>,
+    depth: usize,
+    path: &str,
+    edit: &mut FieldEditContext<'_>,
+) {
+    let options = match field.options() {
+        Some(blam_tags::TagOptions::Flags(options)) => options,
+        _ => Vec::new(),
+    };
+    let display_flags = if options.is_empty() {
+        flag_names
+            .iter()
+            .map(|(bit, label)| (*bit, label.clone(), true))
+            .collect::<Vec<_>>()
+    } else {
+        options
+            .iter()
+            .map(|option| (option.bit, option.name.to_owned(), option.is_set))
+            .collect::<Vec<_>>()
+    };
+
+    let indent = depth as f32 * 12.0;
+    let row_width = ui.available_width().max(620.0);
+    let panel_width = (row_width - indent - FOUNDATION_LABEL_WIDTH - 40.0).clamp(360.0, 760.0);
+    let flag_row_height = 21.0;
+    let panel_height = if display_flags.is_empty() {
+        32.0
+    } else {
+        12.0 + flag_row_height * display_flags.len() as f32 + 24.0
+    };
+    let total_height = panel_height.max(32.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(row_width, total_height), Sense::hover());
+    let painter = ui.painter().clone();
+
+    let label_rect = egui::Rect::from_min_size(
+        rect.left_top() + Vec2::new(indent + 4.0, 4.0),
+        Vec2::new(FOUNDATION_LABEL_WIDTH - 8.0, 24.0),
+    );
+    painter.text(
+        label_rect.left_center(),
+        Align2::LEFT_CENTER,
+        truncate_for_cell(&meta.label, label_rect.width()),
+        FontId::proportional(12.5),
+        text_dark(),
+    );
+
+    let flags_rect = egui::Rect::from_min_size(
+        rect.left_top() + Vec2::new(indent + FOUNDATION_LABEL_WIDTH, 0.0),
+        Vec2::new(panel_width, panel_height),
+    );
+    painter.rect_filled(flags_rect, 0.0, foundation_input());
+    painter.rect_stroke(flags_rect, 0.0, Stroke::new(1.0, foundation_input_edge()));
+
+    if display_flags.is_empty() {
+        painter.text(
+            flags_rect.left_center() + Vec2::new(8.0, 0.0),
+            Align2::LEFT_CENTER,
+            format!("0x{raw:04X} (none set)"),
+            FontId::proportional(12.5),
+            text_dark(),
+        );
+    } else {
+        let mut next_mask = raw;
+        for (index, (bit, label, is_set)) in display_flags.iter().enumerate() {
+            let row_top = flags_rect.top() + 6.0 + index as f32 * flag_row_height;
+            let row_rect = egui::Rect::from_min_size(
+                egui::pos2(flags_rect.left() + 8.0, row_top),
+                Vec2::new(flags_rect.width() - 16.0, flag_row_height),
+            );
+            let checkbox_rect = egui::Rect::from_min_size(
+                row_rect.left_top() + Vec2::new(0.0, 3.0),
+                Vec2::splat(13.0),
+            );
+            let enabled = edit.editable && !meta.read_only;
+            let response = ui.interact(
+                row_rect,
+                ui.make_persistent_id((edit.view_scope, edit.tag_key, path, "flag", *bit)),
+                if enabled {
+                    Sense::click()
+                } else {
+                    Sense::hover()
+                },
+            );
+            if response.hovered() {
+                painter.rect_filled(row_rect, 0.0, foundation_flag_hover());
+                response.clone().on_hover_text(label);
+            }
+
+            painter.rect_filled(checkbox_rect, 0.0, foundation_checkbox_bg(enabled));
+            painter.rect_stroke(
+                checkbox_rect,
+                0.0,
+                Stroke::new(1.0, foundation_input_edge()),
+            );
+            if *is_set {
+                let stroke = Stroke::new(1.6, text_dark());
+                painter.line_segment(
+                    [
+                        checkbox_rect.left_center() + Vec2::new(3.0, 0.0),
+                        checkbox_rect.center() + Vec2::new(-1.0, 3.0),
+                    ],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        checkbox_rect.center() + Vec2::new(-1.0, 3.0),
+                        checkbox_rect.right_center() + Vec2::new(-2.0, -4.0),
+                    ],
+                    stroke,
+                );
+            }
+
+            painter.text(
+                row_rect.left_center() + Vec2::new(20.0, 0.0),
+                Align2::LEFT_CENTER,
+                truncate_for_cell(label, row_rect.width() - 24.0),
+                FontId::proportional(12.5),
+                text_dark(),
+            );
+
+            if response.clicked() {
+                if let Some(bit_mask) = 1u64.checked_shl(*bit) {
+                    if *is_set {
+                        next_mask &= !bit_mask;
+                    } else {
+                        next_mask |= bit_mask;
+                    }
+                    edit.pending.push(PendingFieldEdit {
+                        path: path.to_owned(),
+                        input: next_mask.to_string(),
+                    });
+                }
+            }
+        }
+
+        painter.text(
+            flags_rect.left_bottom() + Vec2::new(8.0, -5.0),
+            Align2::LEFT_BOTTOM,
+            format!("0x{raw:04X}"),
+            FontId::proportional(11.5),
+            subtle_dark(),
+        );
+    }
+
+    if meta.help.is_some() || meta.read_only {
+        ui.allocate_new_ui(
+            egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+                flags_rect.right_top() + Vec2::new(8.0, 0.0),
+                Vec2::new(120.0, 24.0),
+            )),
+            |ui| draw_field_help(ui, meta),
+        );
+    }
+    ui.add_space(4.0);
+}
+
+pub(super) fn draw_foundation_function_row(
+    ui: &mut Ui,
+    meta: &FieldDisplayMeta,
+    function: &TagFunction,
+    depth: usize,
+    path: &str,
+) {
+    ui.horizontal_top(|ui| {
+        ui.add_space(depth as f32 * 12.0);
+        foundation_label_cell(ui, &meta.label);
+        Frame::none()
+            .fill(foundation_group_bg())
+            .stroke(Stroke::new(1.0, foundation_group_edge()))
+            .inner_margin(egui::Margin::same(6.0))
+            .show(ui, |ui| {
+                // `Frame::show` inherits the parent layout, and this row is
+                // built inside a `horizontal_top`. Force a vertical layout so
+                // the function editor stacks its controls / graph / time-period
+                // top-to-bottom (Guerilla-style) instead of sprawling to the
+                // right.
+                ui.vertical(|ui| {
+                    ui.set_min_width(640.0);
+                    ui.push_id(("function", path), |ui| {
+                        // Inline preview is always read-only; the editable
+                        // editor lives in the f() popup.
+                        let mut view = FunctionView::from_function(function.clone());
+                        let mut selected = 0usize;
+                        draw_function_editor_contents(ui, &mut view, false, &mut selected);
+                    });
+                });
+            });
+        draw_field_help(ui, meta);
+    });
+}
+
+/// First-pass editable function types — others stay read-only (graph +
+/// controls disabled) but still round-trip on save.
+pub(super) fn draw_foundation_enum_row(
+    ui: &mut Ui,
+    meta: &FieldDisplayMeta,
+    options: &[&str],
+    current: Option<i64>,
+    depth: usize,
+    path: &str,
+    edit: &mut FieldEditContext<'_>,
+) {
+    let mut selected = current.unwrap_or(-1);
+    ui.horizontal(|ui| {
+        ui.add_space(depth as f32 * 12.0);
+        foundation_label_cell(ui, &meta.label);
+        ui.add_enabled_ui(edit.editable && !meta.read_only, |ui| {
+            egui::ComboBox::from_id_salt((edit.view_scope, edit.tag_key, path, "enum"))
+                .width(240.0)
+                .selected_text(enum_option_label(options, selected))
+                .show_ui(ui, |ui| {
+                    for (index, option) in options.iter().enumerate() {
+                        ui.selectable_value(&mut selected, index as i64, *option);
+                    }
+                });
+        });
+        if Some(selected) != current && selected >= 0 {
+            edit.pending.push(PendingFieldEdit {
+                path: path.to_owned(),
+                input: selected.to_string(),
+            });
+        }
+        draw_field_help(ui, meta);
+    });
+}
+
+pub(super) fn foundation_label_cell(ui: &mut Ui, text: &str) {
+    let width = FOUNDATION_LABEL_WIDTH;
+    let height = 24.0;
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+    ui.painter().text(
+        rect.left_center() + Vec2::new(4.0, 0.0),
+        Align2::LEFT_CENTER,
+        truncate_for_cell(text, width - 6.0),
+        FontId::proportional(12.5),
+        text_dark(),
+    );
+    if response.hovered() && text.len() > 34 {
+        response.on_hover_text(text);
+    }
+}
+
+pub(super) fn foundation_input_cell(ui: &mut Ui, text: &str, width: f32) {
+    let height = 24.0;
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
+    ui.painter().rect_filled(rect, 0.0, foundation_input());
+    ui.painter()
+        .rect_stroke(rect, 0.0, Stroke::new(1.0, foundation_input_edge()));
+    ui.painter().text(
+        rect.left_center() + Vec2::new(5.0, 0.0),
+        Align2::LEFT_CENTER,
+        truncate_for_cell(text, width - 10.0),
+        FontId::proportional(12.5),
+        text_dark(),
+    );
+    if response.hovered() {
+        response.on_hover_text(text);
+    }
+}
+
+pub(super) fn foundation_text_edit_cell(
+    ui: &mut Ui,
+    text: &mut String,
+    width: f32,
+    id: egui::Id,
+) -> egui::Response {
+    ui.scope(|ui| {
+        ui.visuals_mut().widgets.inactive.bg_fill = foundation_input();
+        ui.visuals_mut().widgets.hovered.bg_fill = foundation_input();
+        ui.visuals_mut().widgets.active.bg_fill = foundation_input();
+        ui.visuals_mut().widgets.inactive.fg_stroke = Stroke::new(1.0, text_dark());
+        ui.visuals_mut().widgets.hovered.fg_stroke = Stroke::new(1.0, text_dark());
+        ui.visuals_mut().widgets.active.fg_stroke = Stroke::new(1.0, text_dark());
+        ui.add_sized(
+            [width, 24.0],
+            egui::TextEdit::singleline(text)
+                .id(id)
+                .font(TextStyle::Monospace)
+                .text_color(text_dark())
+                .margin(Vec2::new(4.0, 2.0)),
+        )
+    })
+    .inner
+}
+
+pub(super) fn foundation_value_width(value: &str, available: f32) -> f32 {
+    if value.len() > 48 {
+        available
+    } else if value.len() > 18 {
+        available.min(520.0).max(300.0)
+    } else {
+        available.min(180.0).max(140.0)
+    }
+}
+
+pub(super) fn flag_value_parts(value: &TagFieldData) -> Option<(u64, Vec<(u32, String)>)> {
+    match value {
+        TagFieldData::ByteFlags { value, names } => Some((*value as u64, names.clone())),
+        TagFieldData::WordFlags { value, names } => Some((*value as u64, names.clone())),
+        TagFieldData::LongFlags { value, names } => Some((*value as u32 as u64, names.clone())),
+        TagFieldData::ByteBlockFlags(value) => Some((*value as u64, Vec::new())),
+        TagFieldData::WordBlockFlags(value) => Some((*value as u64, Vec::new())),
+        TagFieldData::LongBlockFlags(value) => Some((*value as u32 as u64, Vec::new())),
+        _ => None,
+    }
+}
+
+pub(super) fn foundation_value_parts(value: &TagFieldData) -> Option<Vec<(String, String)>> {
+    let pair = |a: &str, av: String, b: &str, bv: String| {
+        Some(vec![(a.to_owned(), av), (b.to_owned(), bv)])
+    };
+    let triple = |a: &str, av: String, b: &str, bv: String, c: &str, cv: String| {
+        Some(vec![
+            (a.to_owned(), av),
+            (b.to_owned(), bv),
+            (c.to_owned(), cv),
+        ])
+    };
+    match value {
+        TagFieldData::Point2d(p) => pair("x", p.x.to_string(), "y", p.y.to_string()),
+        TagFieldData::Rectangle2d(r) => Some(vec![
+            ("top".to_owned(), r.top.to_string()),
+            ("left".to_owned(), r.left.to_string()),
+            ("bottom".to_owned(), r.bottom.to_string()),
+            ("right".to_owned(), r.right.to_string()),
+        ]),
+        TagFieldData::RealPoint2d(p) => pair("x", fmt_real(p.x), "y", fmt_real(p.y)),
+        TagFieldData::RealPoint3d(p) => {
+            triple("x", fmt_real(p.x), "y", fmt_real(p.y), "z", fmt_real(p.z))
+        }
+        TagFieldData::RealVector2d(v) => pair("i", fmt_real(v.i), "j", fmt_real(v.j)),
+        TagFieldData::RealVector3d(v) => {
+            triple("i", fmt_real(v.i), "j", fmt_real(v.j), "k", fmt_real(v.k))
+        }
+        TagFieldData::RealQuaternion(q) => Some(vec![
+            ("i".to_owned(), fmt_real(q.i)),
+            ("j".to_owned(), fmt_real(q.j)),
+            ("k".to_owned(), fmt_real(q.k)),
+            ("w".to_owned(), fmt_real(q.w)),
+        ]),
+        TagFieldData::RealEulerAngles2d(e) => {
+            pair("yaw", fmt_real(e.yaw), "pitch", fmt_real(e.pitch))
+        }
+        TagFieldData::RealEulerAngles3d(e) => Some(vec![
+            ("yaw".to_owned(), fmt_real(e.yaw)),
+            ("pitch".to_owned(), fmt_real(e.pitch)),
+            ("roll".to_owned(), fmt_real(e.roll)),
+        ]),
+        TagFieldData::RealPlane2d(p) => {
+            triple("i", fmt_real(p.i), "j", fmt_real(p.j), "d", fmt_real(p.d))
+        }
+        TagFieldData::RealPlane3d(p) => Some(vec![
+            ("i".to_owned(), fmt_real(p.i)),
+            ("j".to_owned(), fmt_real(p.j)),
+            ("k".to_owned(), fmt_real(p.k)),
+            ("d".to_owned(), fmt_real(p.d)),
+        ]),
+        TagFieldData::ShortIntegerBounds(b) => {
+            pair("low", b.lower.to_string(), "high", b.upper.to_string())
+        }
+        TagFieldData::AngleBounds(b)
+        | TagFieldData::RealBounds(b)
+        | TagFieldData::FractionBounds(b) => {
+            pair("low", fmt_real(b.lower), "high", fmt_real(b.upper))
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn format_foundation_scalar_value(names: &TagNameIndex, value: &TagFieldData) -> String {
+    match value {
+        TagFieldData::Angle(v)
+        | TagFieldData::Real(v)
+        | TagFieldData::RealSlider(v)
+        | TagFieldData::RealFraction(v) => fmt_real(*v),
+        TagFieldData::RealRgbColor(c) => format!(
+            "r {}  g {}  b {}",
+            fmt_real(c.red),
+            fmt_real(c.green),
+            fmt_real(c.blue)
+        ),
+        TagFieldData::RealArgbColor(c) => format!(
+            "a {}  r {}  g {}  b {}",
+            fmt_real(c.alpha),
+            fmt_real(c.red),
+            fmt_real(c.green),
+            fmt_real(c.blue)
+        ),
+        TagFieldData::RealHsvColor(c) => format!(
+            "h {}  s {}  v {}",
+            fmt_real(c.hue),
+            fmt_real(c.saturation),
+            fmt_real(c.value)
+        ),
+        TagFieldData::RealAhsvColor(c) => format!(
+            "a {}  h {}  s {}  v {}",
+            fmt_real(c.alpha),
+            fmt_real(c.hue),
+            fmt_real(c.saturation),
+            fmt_real(c.value)
+        ),
+        _ => trim_formatted_value(&format_value(names, value, false)),
+    }
+}
+
+pub(super) fn fmt_real(value: f32) -> String {
+    if !value.is_finite() {
+        return value.to_string();
+    }
+    let truncated = (value * 100.0).trunc() / 100.0;
+    let mut text = format!("{truncated:.2}");
+    while text.contains('.') && text.ends_with('0') {
+        text.pop();
+    }
+    if text.ends_with('.') {
+        text.pop();
+    }
+    if text == "-0" { "0".to_owned() } else { text }
+}
+
+pub(super) fn is_hidden_non_expert_value(value: &TagFieldData, expert_mode: bool) -> bool {
+    !expert_mode && matches!(value, TagFieldData::Custom(bytes) if bytes.is_empty())
+}
+
+pub(super) fn draw_resource(
+    ui: &mut Ui,
+    name: &str,
+    resource: TagResource<'_>,
+    names: &TagNameIndex,
+    depth: usize,
+    expert_mode: bool,
+    path_prefix: &str,
+    edit: &mut FieldEditContext<'_>,
+) {
+    let kind = match resource.kind() {
+        TagResourceKind::Null => "null",
+        TagResourceKind::Exploded => "exploded",
+        TagResourceKind::Xsync => "xsync",
+    };
+    draw_foundation_bar(
+        ui,
+        format!("{}    pageable resource ({kind})", clean_field_name(name)),
+        depth,
+        false,
+        |ui| {
+            draw_foundation_text_row(
+                ui,
+                "inline bytes",
+                &hex_bytes(resource.inline_bytes()),
+                "bytes",
+                depth + 1,
+            );
+            if let Some(payload) = resource.exploded_payload() {
+                draw_foundation_text_row(
+                    ui,
+                    "exploded payload",
+                    &format!("{} bytes", payload.len()),
+                    "bytes",
+                    depth + 1,
+                );
+            }
+            if let Some(payload) = resource.xsync_payload() {
+                draw_foundation_text_row(
+                    ui,
+                    "xsync payload",
+                    &format!("{} bytes", payload.len()),
+                    "bytes",
+                    depth + 1,
+                );
+            }
+            if resource.xsync_state().is_some() {
+                draw_foundation_text_row(
+                    ui,
+                    "hydration",
+                    "hydrated from XSync state",
+                    "xsync",
+                    depth + 1,
+                );
+            }
+            if let Some(nested) = resource.as_struct() {
+                ui.separator();
+                draw_struct_fields_inline(
+                    ui,
+                    nested,
+                    names,
+                    depth + 1,
+                    expert_mode,
+                    path_prefix,
+                    edit,
+                );
+            }
+        },
+    );
+}

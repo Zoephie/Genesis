@@ -1,0 +1,1191 @@
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use blam_tags::monolithic::MonolithicCache;
+use blam_tags::paths::group_tag_to_extension;
+use blam_tags::{TagFile, format_group_tag};
+use serde_json;
+use walkdir::WalkDir;
+
+use crate::format::TagNameIndex;
+
+#[derive(Clone)]
+pub struct TagEntry {
+    pub key: String,
+    pub display_path: String,
+    pub group_tag: u32,
+    pub group_name: Option<String>,
+    pub location: TagEntryLocation,
+}
+
+#[derive(Clone)]
+pub enum TagEntryLocation {
+    LooseFile(PathBuf),
+    Monolithic { name: String, group_tag: u32 },
+}
+
+#[derive(Clone)]
+pub enum TagSource {
+    SingleFile {
+        path: PathBuf,
+    },
+    LooseFolder {
+        root: PathBuf,
+    },
+    MonolithicCache {
+        root: PathBuf,
+        cache: Arc<MonolithicCache>,
+    },
+}
+
+impl TagSource {
+    pub fn origin_label(&self) -> String {
+        match self {
+            TagSource::SingleFile { path } => format!("File: {}", path.display()),
+            TagSource::LooseFolder { root } => format!("Folder: {}", root.display()),
+            TagSource::MonolithicCache { root, .. } => {
+                format!("Monolithic cache: {}", root.display())
+            }
+        }
+    }
+}
+
+pub struct LoadedSourceData {
+    pub label: String,
+    pub source: TagSource,
+    pub names: TagNameIndex,
+    /// Game identifier (e.g. "halo3_mcc"), used for the index cache filename.
+    /// None for single-file and monolithic sources.
+    pub game: Option<String>,
+    /// Lazily-expanded entries for the folder tree (LooseFolder) or all
+    /// entries for Monolithic / SingleFile sources.
+    pub entries: Vec<TagEntry>,
+    pub tree: TagTree,
+    /// Built from `all_entries` once a background scan completes, or from
+    /// `entries` for non-lazy sources (Monolithic / SingleFile).
+    pub group_tree: TagTree,
+    /// Full entry set from a completed background scan (or a loaded cache).
+    /// Empty until populated. Groups mode and filtered search read from this.
+    pub all_entries: Vec<TagEntry>,
+    pub initial_tag: Option<(String, TagFile)>,
+}
+
+#[derive(Debug)]
+pub(crate) struct FolderRootInfo {
+    pub(crate) scan_root: PathBuf,
+    pub(crate) label: String,
+    pub(crate) game: Option<&'static str>,
+}
+
+#[derive(Default)]
+pub struct TagTree {
+    pub children: Vec<TagTreeNode>,
+    pub entries: Vec<usize>,
+}
+
+#[derive(Default)]
+pub struct TagTreeNode {
+    pub label: String,
+    pub rel_path: PathBuf,
+    pub children: Vec<TagTreeNode>,
+    pub children_loaded: bool,
+    pub entries: Vec<usize>,
+    pub entries_loaded: bool,
+}
+
+#[derive(Default)]
+struct TreeBuildNode {
+    entries: Vec<usize>,
+    children: BTreeMap<String, TreeBuildNode>,
+}
+
+pub fn load_single_file(path: PathBuf, names: &TagNameIndex) -> Result<LoadedSourceData> {
+    let tag = TagFile::read(&path).with_context(|| format!("failed to load {}", path.display()))?;
+    let group_tag = tag.group().tag;
+    let group_name = names.name_for(group_tag).map(str::to_owned);
+    let file_name = path
+        .file_name()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("loaded tag"));
+    let display_path = display_path_with_friendly_extension(&file_name, group_tag, names);
+    let key = format!("file:{}", path.display());
+    let entry = TagEntry {
+        key: key.clone(),
+        display_path: display_path.clone(),
+        group_tag,
+        group_name,
+        location: TagEntryLocation::LooseFile(path.clone()),
+    };
+    let entries = vec![entry];
+    Ok(LoadedSourceData {
+        label: display_path,
+        source: TagSource::SingleFile { path },
+        names: names.clone(),
+        game: None,
+        tree: build_tree(&entries),
+        group_tree: build_group_tree(&entries),
+        all_entries: Vec::new(),
+        entries,
+        initial_tag: Some((key, tag)),
+    })
+}
+
+pub fn load_folder(
+    selected_root: PathBuf,
+    fallback_names: &TagNameIndex,
+    definitions_root: &Path,
+) -> Result<LoadedSourceData> {
+    let info = resolve_folder_root(&selected_root)?;
+    let game = info.game.map(str::to_owned);
+    let names = game
+        .as_deref()
+        .and_then(|g| TagNameIndex::load_game(definitions_root, g).ok())
+        .unwrap_or_else(|| fallback_names.clone());
+    let entries = Vec::new();
+    let tree = build_folder_directory_tree(&info.scan_root)
+        .with_context(|| format!("failed to list folders in {}", info.scan_root.display()))?;
+    // Pre-load a saved index so Groups and search work immediately.
+    let all_entries = game
+        .as_deref()
+        .and_then(|g| load_entry_index(g, &info.scan_root))
+        .unwrap_or_default();
+    let group_tree = build_group_tree(&all_entries);
+    Ok(LoadedSourceData {
+        label: info.label,
+        source: TagSource::LooseFolder {
+            root: info.scan_root,
+        },
+        names,
+        game,
+        entries,
+        tree,
+        group_tree,
+        all_entries,
+        initial_tag: None,
+    })
+}
+
+pub fn load_monolithic_blob_index(
+    blob_index: PathBuf,
+    names: &TagNameIndex,
+) -> Result<LoadedSourceData> {
+    let root = normalize_blob_index_path(&blob_index)?;
+    let cache = Arc::new(
+        MonolithicCache::open(&root)
+            .with_context(|| format!("failed to open monolithic cache {}", root.display()))?,
+    );
+    let mut entries = Vec::with_capacity(cache.len());
+    for entry in cache.iter_tags() {
+        if entry.name.is_empty() {
+            continue;
+        }
+        let group_name = names.name_for(entry.group_tag).map(str::to_owned);
+        let display_path = display_str_with_friendly_extension(
+            &entry.name.replace('\\', "/"),
+            entry.group_tag,
+            names,
+        );
+        entries.push(TagEntry {
+            key: format!("cache:{}:{}", format_group_tag(entry.group_tag), entry.name),
+            display_path,
+            group_tag: entry.group_tag,
+            group_name,
+            location: TagEntryLocation::Monolithic {
+                name: entry.name.clone(),
+                group_tag: entry.group_tag,
+            },
+        });
+    }
+    entries.sort_by(|a, b| natural_key(&a.display_path).cmp(&natural_key(&b.display_path)));
+    let label = root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| root.display().to_string());
+    let tree = build_tree(&entries);
+    let group_tree = build_group_tree(&entries);
+    Ok(LoadedSourceData {
+        label,
+        source: TagSource::MonolithicCache { root, cache },
+        names: names.clone(),
+        game: None,
+        all_entries: Vec::new(),
+        entries,
+        tree,
+        group_tree,
+        initial_tag: None,
+    })
+}
+
+pub fn read_entry(source: &TagSource, entry: &TagEntry) -> Result<TagFile> {
+    match (&entry.location, source) {
+        (TagEntryLocation::LooseFile(path), _) => {
+            TagFile::read(path).with_context(|| format!("failed to load {}", path.display()))
+        }
+        (
+            TagEntryLocation::Monolithic { name, group_tag },
+            TagSource::MonolithicCache { cache, .. },
+        ) => cache.read_tag_by_name(*group_tag, name).with_context(|| {
+            format!(
+                "failed to load {} from monolithic cache",
+                entry.display_path
+            )
+        }),
+        (TagEntryLocation::Monolithic { .. }, _) => {
+            anyhow::bail!("monolithic entry selected outside a monolithic source")
+        }
+    }
+}
+
+pub fn normalize_blob_index_path(path: &Path) -> Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    if !file_name.eq_ignore_ascii_case("blob_index.dat") {
+        anyhow::bail!("expected blob_index.dat, got {}", path.display());
+    }
+    path.parent()
+        .map(Path::to_path_buf)
+        .with_context(|| format!("{} has no parent directory", path.display()))
+}
+
+pub fn build_tree(entries: &[TagEntry]) -> TagTree {
+    let mut root = TreeBuildNode::default();
+    for (index, entry) in entries.iter().enumerate() {
+        let parts = split_display_path(&entry.display_path);
+        if parts.len() <= 1 {
+            root.entries.push(index);
+            continue;
+        }
+
+        let mut node = &mut root;
+        for part in &parts[..parts.len() - 1] {
+            node = node.children.entry(part.clone()).or_default();
+        }
+        node.entries.push(index);
+    }
+    TagTree {
+        children: root
+            .children
+            .into_iter()
+            .map(|(label, node)| finish_node(label, node))
+            .collect(),
+        entries: root.entries,
+    }
+}
+
+pub fn build_group_tree(entries: &[TagEntry]) -> TagTree {
+    let mut root = TreeBuildNode::default();
+    for (index, entry) in entries.iter().enumerate() {
+        let fourcc = format_group_tag(entry.group_tag);
+        let group = friendly_group_name(entry.group_tag, entry.group_name.as_deref(), &fourcc);
+        let label = if group == fourcc {
+            fourcc
+        } else {
+            format!("{group} {fourcc}")
+        };
+        root.children.entry(label).or_default().entries.push(index);
+    }
+    TagTree {
+        children: root
+            .children
+            .into_iter()
+            .map(|(label, node)| finish_node(label, node))
+            .collect(),
+        entries: root.entries,
+    }
+}
+
+fn friendly_group_name(group_tag: u32, indexed_name: Option<&str>, fourcc: &str) -> String {
+    if let Some(name) = indexed_name {
+        if !name.eq_ignore_ascii_case(fourcc) {
+            return name.to_owned();
+        }
+    }
+    fallback_group_name(group_tag)
+        .map(str::to_owned)
+        .unwrap_or_else(|| fourcc.to_owned())
+}
+
+fn fallback_group_name(group_tag: u32) -> Option<&'static str> {
+    group_tag_to_extension(group_tag).or_else(|| {
+        let fourcc = group_tag.to_be_bytes();
+        Some(match &fourcc {
+            b"achi" => "achievements",
+            b"adlg" => "ai_dialogue_globals",
+            b"aigl" => "ai_globals",
+            b"mdlg" => "ai_mission_dialogue",
+            b"airs" => "airstrike",
+            b"ant!" => "antenna",
+            b"sefc" => "area_screen_effect",
+            b"armg" => "armormod_globals",
+            b"fogg" => "atmosphere_fog",
+            b"atgf" => "atmosphere_globals",
+            b"aulp" => "authored_light_probe",
+            b"avat" => "avatar_awards",
+            b"bink" => "bink",
+            b"bsdt" => "breakable_surface",
+            b"zone" => "cache_file_resource_gestalt",
+            b"play" => "cache_file_resource_layout_table",
+            b"$#!+" => "cache_file_sound",
+            b"csdt" => "camera_shake",
+            b"trak" => "camera_track",
+            b"cmoe" => "camo",
+            b"chdg" => "challenge_globals_definition",
+            b"char" => "character",
+            b"cine" => "cinematic",
+            b"cisd" => "cinematic_scene_data",
+            b"cisc" => "cinematic_scene",
+            b"clwd" => "cloth",
+            b"cddf" => "collision_damage",
+            b"colo" => "color_table",
+            b"cntl" => "contrail_system",
+            b"bloc" => "crate",
+            b"jpt!" => "damage_effect",
+            b"drdf" => "damage_response_definition",
+            b"decs" => "decal_system",
+            b"dctr" => "decorator_set",
+            b"ctrl" => "device_control",
+            b"mach" => "device_machine",
+            b"term" => "device_terminal",
+            b"udlg" => "dialogue",
+            b"effe" => "effect",
+            b"efsc" => "effect_scenery",
+            b"eqip" => "equipment",
+            b"forg" => "forge_globals",
+            b"fpch" => "fragment_program_control",
+            b"glps" => "global_pixel_shader",
+            b"matg" => "globals",
+            b"grup" => "gui_group_widget_definition",
+            b"gint" => "giant",
+            b"goof" => "gui_datasource_definition",
+            b"txt3" => "gui_text_widget_definition",
+            b"wigl" => "user_interface_globals_definition",
+            b"ugh!" => "sound_cache_file_gestalt",
+            b"ligh" => "light",
+            b"ltvl" => "light_volume_system",
+            b"unic" => "multilingual_unicode_string_list",
+            b"pman" => "particle_model",
+            b"pmov" => "particle_physics",
+            b"phmo" => "physics_model",
+            b"proj" => "projectile",
+            b"rasg" => "rasterizer_globals",
+            b"rm  " => "render_method",
+            b"rmb " => "shader_beam",
+            b"rmcs" => "shader_custom",
+            b"rmct" => "shader_cortana",
+            b"rmd " => "shader_decal",
+            b"rmfl" => "shader_foliage",
+            b"rmhg" => "shader_halogram",
+            b"rmp " => "shader_particle",
+            b"rmsk" => "shader_skin",
+            b"rmtr" => "shader_terrain",
+            b"rmw " => "shader_water",
+            b"rmsh" => "shader",
+            b"scnr" => "scenario",
+            b"sbsp" => "scenario_structure_bsp",
+            b"scen" => "scenery",
+            b"ssce" => "sound_scenery",
+            b"snd!" => "sound",
+            b"snde" => "sound_effect_template",
+            b"lsnd" => "sound_looping",
+            b"spk!" => "sound_mix",
+            b"stli" => "scenario_structure_lighting_info",
+            b"styl" => "style",
+            b"trac" => "tracer_system",
+            b"unit" => "unit",
+            b"vehi" => "vehicle",
+            b"weap" => "weapon",
+            b"wind" => "wind",
+            _ => return None,
+        })
+    })
+}
+
+pub fn load_folder_node_entries(
+    root: &Path,
+    node: &mut TagTreeNode,
+    entries: &mut Vec<TagEntry>,
+    names: &TagNameIndex,
+) -> Result<()> {
+    if !node.children_loaded {
+        node.children = list_direct_child_nodes(root, &node.rel_path)?;
+        node.children_loaded = true;
+    }
+    if node.entries_loaded {
+        return Ok(());
+    }
+    let folder = root.join(&node.rel_path);
+    let mut new_entries = scan_folder_direct_entries(root, &folder, names)?;
+    new_entries.sort_by(|a, b| natural_key(&a.display_path).cmp(&natural_key(&b.display_path)));
+    let start = entries.len();
+    node.entries.extend(start..start + new_entries.len());
+    entries.extend(new_entries);
+    node.entries_loaded = true;
+    Ok(())
+}
+
+pub fn scan_folder_subtree_entries(
+    root: &Path,
+    rel_path: &Path,
+    names: &TagNameIndex,
+) -> Result<Vec<TagEntry>> {
+    let folder = root.join(rel_path);
+    let mut entries = Vec::new();
+    for item in WalkDir::new(&folder).follow_links(false) {
+        let item = item?;
+        if !item.file_type().is_file() {
+            continue;
+        }
+        let path = item.into_path();
+        let Some(group_tag) = probe_tag_group(&path)? else {
+            continue;
+        };
+        let rel = path.strip_prefix(root).unwrap_or(path.as_path());
+        let group_name = names.name_for(group_tag).map(str::to_owned);
+        let display_path = display_path_with_friendly_extension(rel, group_tag, names);
+        entries.push(TagEntry {
+            key: format!("file:{}", path.display()),
+            display_path,
+            group_tag,
+            group_name,
+            location: TagEntryLocation::LooseFile(path),
+        });
+    }
+    entries.sort_by(|a, b| natural_key(&a.display_path).cmp(&natural_key(&b.display_path)));
+    Ok(entries)
+}
+
+// ── Index persistence ─────────────────────────────────────────────────────────
+
+/// Derive a stable index filename from the game name stored in `FolderRootInfo`.
+/// e.g. "halo3_mcc" → `halo3_mcc_index.json`.
+pub fn index_path(game: &str) -> PathBuf {
+    let filename = format!("{game}_index.json");
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        return PathBuf::from(appdata).join("Genesis").join(filename);
+    }
+    if let Some(home) = std::env::var_os("USERPROFILE") {
+        return PathBuf::from(home)
+            .join(".config")
+            .join("genesis")
+            .join(filename);
+    }
+    PathBuf::from(filename)
+}
+
+/// Serialize `entries` to `{game}_index.json`. Called from the background
+/// worker after a full scan completes so it never blocks the UI thread.
+/// `root` is recorded so a stale index from a different folder for the same
+/// game is rejected on load.
+pub fn save_entry_index(game: &str, root: &Path, entries: &[TagEntry]) -> Result<()> {
+    let path = index_path(game);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).context("create config dir")?;
+    }
+    let items: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "key": &e.key,
+                "display_path": &e.display_path,
+                "group_tag": e.group_tag,
+                "group_name": e.group_name,
+            })
+        })
+        .collect();
+    let text = serde_json::to_string(&serde_json::json!({
+        "root": root.display().to_string(),
+        "entries": items,
+    }))
+    .context("serialize index")?;
+    std::fs::write(&path, text).context("write index file")?;
+    Ok(())
+}
+
+/// Load a previously saved index for `game`. Returns `None` if no file exists,
+/// it can't be parsed, or it was saved for a different `root` folder (the keys
+/// are absolute paths, so the index is only valid for its original root).
+pub fn load_entry_index(game: &str, root: &Path) -> Option<Vec<TagEntry>> {
+    let path = index_path(game);
+    let text = std::fs::read_to_string(&path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    // Reject an index saved for a different root folder.
+    let saved_root = value.get("root").and_then(|v| v.as_str())?;
+    if saved_root != root.display().to_string() {
+        return None;
+    }
+    let items = value.get("entries")?.as_array()?;
+    let mut entries = Vec::with_capacity(items.len());
+    for item in items {
+        let key = item.get("key")?.as_str()?.to_owned();
+        let display_path = item.get("display_path")?.as_str()?.to_owned();
+        let group_tag = item.get("group_tag")?.as_u64()? as u32;
+        let group_name = item
+            .get("group_name")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        // Reconstruct the file path from the key ("file:{absolute_path}").
+        let location = if let Some(abs) = key.strip_prefix("file:") {
+            TagEntryLocation::LooseFile(PathBuf::from(abs))
+        } else {
+            continue; // unknown location kind — skip
+        };
+        entries.push(TagEntry {
+            key,
+            display_path,
+            group_tag,
+            group_name,
+            location,
+        });
+    }
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries)
+    }
+}
+
+#[cfg(test)]
+pub fn field_row_summaries(tag: &TagFile, names: &TagNameIndex, limit: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    for field in tag.root().fields().take(limit) {
+        let kind = if let Some(value) = field.value() {
+            crate::format::format_value(names, &value, false)
+        } else if let Some(block) = field.as_block() {
+            format!("block [{} elements]", block.len())
+        } else if let Some(array) = field.as_array() {
+            format!("array [{} elements]", array.len())
+        } else if field.as_struct().is_some() {
+            "struct".to_owned()
+        } else if let Some(resource) = field.as_resource() {
+            format!("resource {:?}", resource.kind())
+        } else {
+            "container".to_owned()
+        };
+        rows.push(format!("{}:{}={kind}", field.name(), field.type_name()));
+    }
+    rows
+}
+
+pub(crate) fn resolve_folder_root(selected_root: &Path) -> Result<FolderRootInfo> {
+    let ek_root = detect_ek_root(selected_root);
+    let game = ek_root.as_ref().map(|(_, game)| *game);
+    let scan_root = if is_tags_folder(selected_root) {
+        selected_root.to_path_buf()
+    } else if let Some((ek_root, _)) = ek_root {
+        let tags = ek_root.join("tags");
+        if !tags.is_dir() {
+            anyhow::bail!(
+                "recognized {} as an EK root, but expected tags folder was missing: {}",
+                ek_root.display(),
+                tags.display()
+            );
+        }
+        tags
+    } else {
+        find_tags_folder(selected_root).unwrap_or_else(|| selected_root.to_path_buf())
+    };
+    let label = folder_source_label(selected_root, &scan_root, game);
+    Ok(FolderRootInfo {
+        scan_root,
+        label,
+        game,
+    })
+}
+
+fn find_tags_folder(selected_root: &Path) -> Option<PathBuf> {
+    if is_tags_folder(selected_root) {
+        return Some(selected_root.to_path_buf());
+    }
+
+    let direct = selected_root.join("tags");
+    if direct.is_dir() {
+        return Some(direct);
+    }
+
+    WalkDir::new(selected_root)
+        .min_depth(1)
+        .max_depth(3)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry.file_type().is_dir()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("tags"))
+        })
+        .map(|entry| entry.into_path())
+}
+
+fn is_tags_folder(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("tags"))
+}
+
+fn detect_ek_game(path: &Path) -> Option<&'static str> {
+    detect_ek_root(path).map(|(_, game)| game)
+}
+
+fn detect_ek_root(path: &Path) -> Option<(PathBuf, &'static str)> {
+    path.ancestors()
+        .filter_map(|ancestor| {
+            ancestor
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| ek_folder_game(name).map(|game| (ancestor.to_path_buf(), game)))
+        })
+        .next()
+}
+
+fn ek_folder_game(name: &str) -> Option<&'static str> {
+    match name.to_ascii_uppercase().as_str() {
+        "HREK" => Some("haloreach_mcc"),
+        "H4EK" => Some("halo4_mcc"),
+        "H3ODSTEK" => Some("halo3odst_mcc"),
+        "H3EK" => Some("halo3_mcc"),
+        "H2AMPEK" | "H2AEK" => Some("halo2amp_mcc"),
+        _ => None,
+    }
+}
+
+fn folder_source_label(
+    selected_root: &Path,
+    scan_root: &Path,
+    game: Option<&'static str>,
+) -> String {
+    let selected_label = selected_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| selected_root.display().to_string());
+    let mut label = if scan_root != selected_root {
+        format!("{selected_label}/tags")
+    } else {
+        selected_label
+    };
+    if let Some(game) = game {
+        label.push_str(&format!(" ({game})"));
+    }
+    label
+}
+
+fn scan_folder_entries(root: &Path, names: &TagNameIndex) -> Result<Vec<TagEntry>> {
+    let mut entries = Vec::new();
+    for item in WalkDir::new(root).follow_links(false) {
+        let item = item?;
+        if !item.file_type().is_file() {
+            continue;
+        }
+        let path = item.into_path();
+        let Some(group_tag) = probe_tag_group(&path)? else {
+            continue;
+        };
+        let rel = path.strip_prefix(root).unwrap_or(path.as_path());
+        let group_name = names.name_for(group_tag).map(str::to_owned);
+        let display_path = display_path_with_friendly_extension(rel, group_tag, names);
+        entries.push(TagEntry {
+            key: format!("file:{}", path.display()),
+            display_path,
+            group_tag,
+            group_name,
+            location: TagEntryLocation::LooseFile(path),
+        });
+    }
+    Ok(entries)
+}
+
+fn build_folder_directory_tree(root: &Path) -> Result<TagTree> {
+    let mut tree = TagTree::default();
+    tree.entries = Vec::new();
+    tree.children = list_direct_child_nodes(root, Path::new(""))?;
+    Ok(tree)
+}
+
+fn list_direct_child_nodes(root: &Path, rel_path: &Path) -> Result<Vec<TagTreeNode>> {
+    let folder = root.join(&rel_path);
+    let mut children = Vec::new();
+    for item in std::fs::read_dir(&folder)
+        .with_context(|| format!("failed to read {}", folder.display()))?
+    {
+        let item = item?;
+        let file_type = item.file_type()?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let label = item.file_name().to_string_lossy().into_owned();
+        children.push(build_folder_node(rel_path.join(label)));
+    }
+    children.sort_by(|a, b| natural_key(&a.label).cmp(&natural_key(&b.label)));
+    Ok(children)
+}
+
+fn build_folder_node(rel_path: PathBuf) -> TagTreeNode {
+    let label = rel_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_owned();
+    TagTreeNode {
+        label,
+        rel_path,
+        children: Vec::new(),
+        children_loaded: false,
+        entries: Vec::new(),
+        entries_loaded: false,
+    }
+}
+
+fn scan_folder_direct_entries(
+    root: &Path,
+    folder: &Path,
+    names: &TagNameIndex,
+) -> Result<Vec<TagEntry>> {
+    let mut entries = Vec::new();
+    for item in
+        std::fs::read_dir(folder).with_context(|| format!("failed to read {}", folder.display()))?
+    {
+        let item = item?;
+        if !item.file_type()?.is_file() {
+            continue;
+        }
+        let path = item.path();
+        let Some(group_tag) = probe_tag_group(&path)? else {
+            continue;
+        };
+        let rel = path.strip_prefix(root).unwrap_or(path.as_path());
+        let group_name = names.name_for(group_tag).map(str::to_owned);
+        let display_path = display_path_with_friendly_extension(rel, group_tag, names);
+        entries.push(TagEntry {
+            key: format!("file:{}", path.display()),
+            display_path,
+            group_tag,
+            group_name,
+            location: TagEntryLocation::LooseFile(path),
+        });
+    }
+    Ok(entries)
+}
+
+fn probe_tag_group(path: &Path) -> Result<Option<u32>> {
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    if len < 64 {
+        return Ok(None);
+    }
+
+    let mut header = [0u8; 64];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut header)?;
+    match &header[60..64] {
+        b"MALB" => Ok(Some(u32::from_le_bytes([
+            header[48], header[49], header[50], header[51],
+        ]))),
+        b"BLAM" => Ok(Some(u32::from_be_bytes([
+            header[48], header[49], header[50], header[51],
+        ]))),
+        _ => Ok(None),
+    }
+}
+
+fn finish_node(label: String, node: TreeBuildNode) -> TagTreeNode {
+    TagTreeNode {
+        label,
+        children: node
+            .children
+            .into_iter()
+            .map(|(label, node)| finish_node(label, node))
+            .collect(),
+        entries: node.entries,
+        ..Default::default()
+    }
+}
+
+fn split_display_path(path: &str) -> Vec<String> {
+    path.split(['/', '\\'])
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn path_to_display(path: &Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn display_path_with_friendly_extension(
+    path: &Path,
+    group_tag: u32,
+    names: &TagNameIndex,
+) -> String {
+    let display = path_to_display(path);
+    display_str_with_friendly_extension(&display, group_tag, names)
+}
+
+fn display_str_with_friendly_extension(
+    display: &str,
+    group_tag: u32,
+    names: &TagNameIndex,
+) -> String {
+    let extension = friendly_extension(group_tag, names);
+    match display.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => format!("{stem}.{extension}"),
+        _ => format!("{display}.{extension}"),
+    }
+}
+
+fn friendly_extension(group_tag: u32, names: &TagNameIndex) -> String {
+    names
+        .name_for(group_tag)
+        .or_else(|| gui_group_tag_to_extension(group_tag))
+        .or_else(|| group_tag_to_extension(group_tag))
+        .map(str::to_owned)
+        .unwrap_or_else(|| format_group_tag(group_tag))
+}
+
+fn gui_group_tag_to_extension(group_tag: u32) -> Option<&'static str> {
+    Some(match format_group_tag(group_tag).trim_end() {
+        "mat" => "material",
+        "mats" => "material_shader",
+        "mtsb" => "material_shader_bank",
+        "hlmt" => "model",
+        "mode" => "render_model",
+        "coll" => "collision_model",
+        "phmo" => "physics_model",
+        "jmad" => "model_animation_graph",
+        "bipd" => "biped",
+        "vehi" => "vehicle",
+        "weap" => "weapon",
+        "scen" => "scenery",
+        "crat" => "crate",
+        "mach" => "device_machine",
+        "bloc" => "device_control",
+        "bitm" => "bitmap",
+        "sbsp" => "scenario_structure_bsp",
+        "scnr" => "scenario",
+        "impo" => "imposter_model",
+        "frms" => "frame_event_list",
+        "effe" => "effect",
+        "snd!" => "sound",
+        "rmsh" => "shader",
+        "rmtr" => "shader_terrain",
+        "rmw" => "shader_water",
+        "rmfl" => "shader_foliage",
+        "rmd" => "shader_decal",
+        "rmhg" => "shader_halogram",
+        "rmsk" => "shader_skin",
+        "rmct" => "shader_cortana",
+        "rmcs" => "shader_custom",
+        _ => return None,
+    })
+}
+
+fn natural_key(value: &str) -> String {
+    value.to_ascii_lowercase().replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("blam_tag_gui_{name}_{stamp}"))
+    }
+
+    fn write_fake_tag(path: &Path, group: &[u8; 4]) {
+        let mut bytes = [0u8; 64];
+        let group_tag = u32::from_be_bytes(*group);
+        bytes[48..52].copy_from_slice(&group_tag.to_le_bytes());
+        bytes[60..64].copy_from_slice(b"MALB");
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn normalizes_blob_index_to_parent_cache_root() {
+        let root = PathBuf::from(r"C:\tags\tag_cache");
+        let blob = root.join("blob_index.dat");
+        assert_eq!(normalize_blob_index_path(&blob).unwrap(), root);
+        assert!(normalize_blob_index_path(&root.join("tag_blob.dat")).is_err());
+    }
+
+    #[test]
+    fn scans_loose_folder_with_header_probe() {
+        let root = temp_dir("scan");
+        fs::create_dir_all(root.join("objects/characters")).unwrap();
+        write_fake_tag(&root.join("objects/characters/test.biped"), b"bipd");
+        fs::write(root.join("not_a_tag.txt"), b"hello").unwrap();
+
+        let index = TagNameIndex::default();
+        let entries = scan_folder_entries(&root, &index).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].display_path, "objects/characters/test.biped");
+        assert_eq!(format_group_tag(entries[0].group_tag), "bipd");
+    }
+
+    #[test]
+    fn load_folder_descends_into_ek_tags_root() {
+        let root = temp_dir("h4ek");
+        let ek_root = root.join("H4EK");
+        fs::create_dir_all(ek_root.join("tags/objects/vehicles")).unwrap();
+        fs::create_dir_all(ek_root.join("data/objects/vehicles")).unwrap();
+        write_fake_tag(
+            &ek_root.join("tags/objects/vehicles/warthog.model"),
+            b"hlmt",
+        );
+        write_fake_tag(
+            &ek_root.join("data/objects/vehicles/not_in_tags.model"),
+            b"hlmt",
+        );
+
+        let loaded = load_folder(
+            ek_root.clone(),
+            &TagNameIndex::default(),
+            &root.join("definitions"),
+        )
+        .unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(loaded.label, "H4EK/tags (halo4_mcc)");
+        assert!(loaded.entries.is_empty());
+        assert_eq!(loaded.tree.children[0].label, "objects");
+        assert_eq!(loaded.tree.children[0].rel_path, PathBuf::from("objects"));
+        assert!(loaded.tree.children[0].children.is_empty());
+        assert!(!loaded.tree.children[0].children_loaded);
+        assert!(!loaded.tree.children[0].entries_loaded);
+        match loaded.source {
+            TagSource::LooseFolder { root } => assert!(root.ends_with("tags")),
+            _ => panic!("expected loose folder source"),
+        }
+    }
+
+    #[test]
+    fn lazy_folder_node_loads_only_direct_tag_files() {
+        let root = temp_dir("lazy_node");
+        fs::create_dir_all(root.join("objects/vehicles/child")).unwrap();
+        write_fake_tag(&root.join("objects/vehicles/warthog.model"), b"hlmt");
+        write_fake_tag(&root.join("objects/vehicles/child/child.model"), b"hlmt");
+
+        let mut tree = build_folder_directory_tree(&root).unwrap();
+        let mut entries = Vec::new();
+        let objects = &mut tree.children[0];
+        load_folder_node_entries(&root, objects, &mut entries, &TagNameIndex::default()).unwrap();
+        let vehicles = &mut objects.children[0];
+        load_folder_node_entries(&root, vehicles, &mut entries, &TagNameIndex::default()).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].display_path, "objects/vehicles/warthog.model");
+        assert!(vehicles.entries_loaded);
+    }
+
+    #[test]
+    fn subtree_scan_finds_nested_tag_files_for_folder_export() {
+        let root = temp_dir("subtree_export");
+        fs::create_dir_all(root.join("objects/vehicles/child")).unwrap();
+        fs::create_dir_all(root.join("objects/characters")).unwrap();
+        write_fake_tag(&root.join("objects/vehicles/warthog.model"), b"hlmt");
+        write_fake_tag(&root.join("objects/vehicles/child/child.model"), b"hlmt");
+        write_fake_tag(&root.join("objects/characters/spartan.model"), b"hlmt");
+
+        let entries = scan_folder_subtree_entries(
+            &root,
+            Path::new("objects/vehicles"),
+            &TagNameIndex::default(),
+        )
+        .unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        let display_paths = entries
+            .into_iter()
+            .map(|entry| entry.display_path)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            display_paths,
+            vec![
+                "objects/vehicles/child/child.model",
+                "objects/vehicles/warthog.model",
+            ]
+        );
+    }
+
+    #[test]
+    fn ek_root_without_tags_folder_errors_without_deep_search() {
+        let root = temp_dir("missing_tags");
+        let ek_root = root.join("HREK");
+        fs::create_dir_all(ek_root.join("data/tags")).unwrap();
+
+        let error = resolve_folder_root(&ek_root).unwrap_err().to_string();
+        fs::remove_dir_all(&root).unwrap();
+
+        assert!(error.contains("expected tags folder was missing"));
+        assert!(error.contains("HREK"));
+    }
+
+    #[test]
+    fn detects_supported_ek_games_from_root_or_tags_folder() {
+        assert_eq!(
+            detect_ek_game(&PathBuf::from("HREK")),
+            Some("haloreach_mcc")
+        );
+        assert_eq!(
+            detect_ek_game(&PathBuf::from("H4EK").join("tags")),
+            Some("halo4_mcc")
+        );
+        assert_eq!(
+            detect_ek_game(&PathBuf::from("H3ODSTEK").join("tags")),
+            Some("halo3odst_mcc")
+        );
+        assert_eq!(
+            detect_ek_game(&PathBuf::from("H3EK").join("tags")),
+            Some("halo3_mcc")
+        );
+    }
+
+    #[test]
+    fn rewrites_short_cache_suffixes_to_foundation_names() {
+        let names = TagNameIndex::default();
+        let cases = [
+            (
+                b"bipd",
+                "objects/characters/spartans/spartans.bipd",
+                "objects/characters/spartans/spartans.biped",
+            ),
+            (
+                b"coll",
+                "objects/characters/spartans/spartans.coll",
+                "objects/characters/spartans/spartans.collision_model",
+            ),
+            (
+                b"phmo",
+                "objects/characters/spartans/spartans.phmo",
+                "objects/characters/spartans/spartans.physics_model",
+            ),
+            (
+                b"jmad",
+                "objects/characters/spartans/spartans.jmad",
+                "objects/characters/spartans/spartans.model_animation_graph",
+            ),
+            (
+                b"impo",
+                "objects/characters/spartans/spartans.impo",
+                "objects/characters/spartans/spartans.imposter_model",
+            ),
+            (
+                b"frms",
+                "objects/characters/spartans/spartans.frms",
+                "objects/characters/spartans/spartans.frame_event_list",
+            ),
+        ];
+
+        for (group, input, expected) in cases {
+            let group_tag = u32::from_be_bytes(*group);
+            assert_eq!(
+                display_str_with_friendly_extension(input, group_tag, &names),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn builds_hierarchical_tree_from_display_paths() {
+        let entries = vec![
+            TagEntry {
+                key: "a".into(),
+                display_path: "objects/test/a.biped".into(),
+                group_tag: u32::from_be_bytes(*b"bipd"),
+                group_name: None,
+                location: TagEntryLocation::LooseFile(PathBuf::from("a")),
+            },
+            TagEntry {
+                key: "b".into(),
+                display_path: "objects/test/b.model".into(),
+                group_tag: u32::from_be_bytes(*b"hlmt"),
+                group_name: None,
+                location: TagEntryLocation::LooseFile(PathBuf::from("b")),
+            },
+        ];
+        let tree = build_tree(&entries);
+        assert_eq!(tree.children[0].label, "objects");
+        assert_eq!(tree.children[0].children[0].label, "test");
+        assert_eq!(tree.children[0].children[0].entries, vec![0, 1]);
+    }
+
+    #[test]
+    fn builds_group_tree_from_entries() {
+        let entries = vec![
+            TagEntry {
+                key: "a".into(),
+                display_path: "objects/test/a.biped".into(),
+                group_tag: u32::from_be_bytes(*b"bipd"),
+                group_name: Some("biped".into()),
+                location: TagEntryLocation::LooseFile(PathBuf::from("a")),
+            },
+            TagEntry {
+                key: "b".into(),
+                display_path: "objects/test/b2.biped".into(),
+                group_tag: u32::from_be_bytes(*b"bipd"),
+                group_name: Some("biped".into()),
+                location: TagEntryLocation::LooseFile(PathBuf::from("b")),
+            },
+            TagEntry {
+                key: "c".into(),
+                display_path: "objects/test/c.render_model".into(),
+                group_tag: u32::from_be_bytes(*b"mode"),
+                group_name: Some("render_model".into()),
+                location: TagEntryLocation::LooseFile(PathBuf::from("c")),
+            },
+        ];
+        let tree = build_group_tree(&entries);
+        assert_eq!(tree.children.len(), 2);
+        assert_eq!(tree.children[0].label, "biped bipd");
+        assert_eq!(tree.children[0].entries, vec![0, 1]);
+    }
+
+    #[test]
+    fn group_tree_uses_friendly_fallback_when_name_is_fourcc() {
+        let entries = vec![TagEntry {
+            key: "a".into(),
+            display_path: "objects/test/a.weapon".into(),
+            group_tag: u32::from_be_bytes(*b"weap"),
+            group_name: Some("weap".into()),
+            location: TagEntryLocation::LooseFile(PathBuf::from("a")),
+        }];
+
+        let tree = build_group_tree(&entries);
+
+        assert_eq!(tree.children[0].label, "weapon weap");
+    }
+
+    #[test]
+    fn builds_field_summaries_from_fixture_when_present() {
+        let fixture = PathBuf::from("dump/storm_knight/storm_knight.biped");
+        if !fixture.exists() {
+            return;
+        }
+        let tag = TagFile::read(&fixture).unwrap();
+        let rows = field_row_summaries(&tag, &TagNameIndex::default(), 24);
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("block") || r.contains("struct"))
+        );
+    }
+}

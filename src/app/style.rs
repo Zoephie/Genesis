@@ -1,0 +1,274 @@
+use super::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+pub(super) fn foundation_visuals() -> egui::Visuals {
+    let mut visuals = if is_dark_mode() {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+    visuals.override_text_color = Some(text_dark());
+    visuals.panel_fill = editor_bg();
+    visuals.window_fill = editor_bg();
+    visuals.faint_bg_color = row_type();
+    visuals.extreme_bg_color = if is_dark_mode() {
+        Color32::from_rgb(30, 30, 29)
+    } else {
+        foundation_input()
+    };
+    visuals.selection.bg_fill = if is_dark_mode() {
+        Color32::from_rgb(64, 108, 134)
+    } else {
+        Color32::from_rgb(42, 91, 122)
+    };
+    visuals.selection.stroke = Stroke::new(1.0, Color32::from_rgb(120, 170, 198));
+    visuals.widgets.noninteractive.bg_fill = row_type();
+    visuals.widgets.inactive.bg_fill = if is_dark_mode() {
+        Color32::from_rgb(56, 56, 54)
+    } else {
+        Color32::from_rgb(218, 218, 214)
+    };
+    visuals.widgets.hovered.bg_fill = if is_dark_mode() {
+        Color32::from_rgb(70, 76, 78)
+    } else {
+        Color32::from_rgb(201, 215, 221)
+    };
+    visuals.widgets.active.bg_fill = if is_dark_mode() {
+        Color32::from_rgb(78, 86, 90)
+    } else {
+        Color32::from_rgb(188, 207, 216)
+    };
+    visuals
+}
+
+pub(super) fn foundation_fonts() -> FontDefinitions {
+    let mut fonts = FontDefinitions::default();
+    for path in [
+        r"C:\Windows\Fonts\micross.ttf",
+        r"C:\Windows\Fonts\tahoma.ttf",
+        r"C:\Windows\Fonts\segoeui.ttf",
+    ] {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts
+                .font_data
+                .insert("foundation_ui".to_owned(), FontData::from_owned(bytes));
+            fonts
+                .families
+                .entry(FontFamily::Proportional)
+                .or_default()
+                .insert(0, "foundation_ui".to_owned());
+            break;
+        }
+    }
+    fonts
+}
+
+pub(super) fn foundation_style() -> egui::Style {
+    let mut style = egui::Style::default();
+    style
+        .text_styles
+        .insert(TextStyle::Heading, FontId::proportional(17.0));
+    style
+        .text_styles
+        .insert(TextStyle::Body, FontId::proportional(12.0));
+    style
+        .text_styles
+        .insert(TextStyle::Button, FontId::proportional(12.0));
+    style
+        .text_styles
+        .insert(TextStyle::Small, FontId::proportional(10.0));
+    style
+        .text_styles
+        .insert(TextStyle::Monospace, FontId::proportional(12.0));
+    style.spacing.item_spacing = Vec2::new(4.0, 3.0);
+    style.spacing.button_padding = Vec2::new(5.0, 2.0);
+    style
+}
+
+static DARK_MODE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn set_dark_mode(enabled: bool) {
+    DARK_MODE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub(super) fn is_dark_mode() -> bool {
+    DARK_MODE_ENABLED.load(Ordering::Relaxed)
+}
+
+pub(super) fn menu_bar() -> Color32 {
+    if is_dark_mode() {
+        Color32::from_rgb(50, 50, 48)
+    } else {
+        Color32::from_rgb(161, 161, 157)
+    }
+}
+
+pub(super) fn foundation_blue() -> Color32 {
+    if is_dark_mode() {
+        Color32::from_rgb(134, 184, 213)
+    } else {
+        Color32::from_rgb(15, 43, 64)
+    }
+}
+
+pub(super) fn left_panel() -> Color32 {
+    if is_dark_mode() {
+        Color32::from_rgb(34, 34, 34)
+    } else {
+        Color32::from_rgb(238, 238, 234)
+    }
+}
+
+pub(super) fn editor_bg() -> Color32 {
+    if is_dark_mode() {
+        Color32::from_rgb(42, 42, 40)
+    } else {
+        Color32::from_rgb(224, 224, 220)
+    }
+}
+
+pub(super) fn row_type() -> Color32 {
+    if is_dark_mode() {
+        Color32::from_rgb(58, 58, 56)
+    } else {
+        Color32::from_rgb(219, 219, 216)
+    }
+}
+
+pub(super) fn grid_line() -> Color32 {
+    if is_dark_mode() {
+        Color32::from_rgb(96, 96, 92)
+    } else {
+        Color32::from_rgb(180, 180, 174)
+    }
+}
+
+pub(super) fn foundation_group_bg() -> Color32 {
+    if is_dark_mode() {
+        Color32::from_rgb(45, 45, 43)
+    } else {
+        Color32::from_rgb(236, 236, 234)
+    }
+}
+
+pub(super) fn foundation_group_edge() -> Color32 {
+    if is_dark_mode() {
+        Color32::from_rgb(96, 96, 92)
+    } else {
+        Color32::from_rgb(152, 152, 148)
+    }
+}
+
+pub(super) fn foundation_section_bar() -> Color32 {
+    if is_dark_mode() {
+        Color32::from_rgb(68, 68, 65)
+    } else {
+        Color32::from_rgb(214, 214, 210)
+    }
+}
+
+pub(super) fn foundation_block_bar() -> Color32 {
+    if is_dark_mode() {
+        Color32::from_rgb(92, 92, 88)
+    } else {
+        Color32::from_rgb(98, 98, 96)
+    }
+}
+
+pub(super) fn foundation_block_text() -> Color32 {
+    Color32::from_rgb(248, 248, 246)
+}
+
+pub(super) fn foundation_input() -> Color32 {
+    if is_dark_mode() {
+        Color32::from_rgb(55, 55, 53)
+    } else {
+        Color32::from_rgb(248, 248, 247)
+    }
+}
+
+pub(super) fn foundation_input_edge() -> Color32 {
+    if is_dark_mode() {
+        Color32::from_rgb(156, 156, 150)
+    } else {
+        Color32::from_rgb(112, 112, 108)
+    }
+}
+
+pub(super) fn text_dark() -> Color32 {
+    if is_dark_mode() {
+        Color32::from_rgb(236, 236, 232)
+    } else {
+        Color32::from_rgb(25, 25, 24)
+    }
+}
+
+pub(super) fn subtle_dark() -> Color32 {
+    if is_dark_mode() {
+        Color32::from_rgb(184, 184, 178)
+    } else {
+        Color32::from_rgb(82, 82, 78)
+    }
+}
+
+pub(super) fn function_plot_bg() -> Color32 {
+    if is_dark_mode() {
+        Color32::from_rgb(64, 64, 62)
+    } else {
+        Color32::from_rgb(205, 205, 205)
+    }
+}
+
+pub(super) fn function_grid_line() -> Color32 {
+    if is_dark_mode() {
+        Color32::from_rgb(132, 132, 126)
+    } else {
+        Color32::from_rgb(92, 92, 88)
+    }
+}
+
+pub(super) fn foundation_flag_hover() -> Color32 {
+    if is_dark_mode() {
+        Color32::from_rgb(58, 58, 56)
+    } else {
+        Color32::from_rgb(232, 232, 228)
+    }
+}
+
+pub(super) fn foundation_checkbox_bg(enabled: bool) -> Color32 {
+    if !enabled {
+        return if is_dark_mode() {
+            Color32::from_rgb(44, 44, 42)
+        } else {
+            Color32::from_rgb(226, 226, 222)
+        };
+    }
+    foundation_input()
+}
+
+pub(super) const MATERIAL_PANEL: Color32 = Color32::from_rgb(238, 238, 235);
+pub(super) const MATERIAL_PANEL_EDGE: Color32 = Color32::from_rgb(168, 168, 162);
+pub(super) const MATERIAL_REF_ROW: Color32 = Color32::from_rgb(166, 205, 166);
+pub(super) const MATERIAL_NUMERIC_ROW: Color32 = Color32::from_rgb(232, 191, 171);
+pub(super) const MATERIAL_DATA_ROW: Color32 = Color32::from_rgb(216, 216, 216);
+pub(super) const MATERIAL_GRID: Color32 = Color32::from_rgb(92, 92, 92);
+pub(super) const MATERIAL_GRID_LIGHT: Color32 = Color32::from_rgb(198, 198, 192);
+pub(super) const MATERIAL_INPUT_EDGE: Color32 = Color32::from_rgb(112, 112, 112);
+pub(super) const MATERIAL_DEFAULT_BOX: Color32 = Color32::from_rgb(224, 224, 224);
+pub(super) const MATERIAL_TEXT: Color32 = Color32::from_rgb(20, 20, 20);
+pub(super) const MATERIAL_MUTED_TEXT: Color32 = Color32::from_rgb(96, 96, 96);
+pub(super) const MATERIAL_FUNCTION_ROW: Color32 = Color32::from_rgb(239, 205, 137);
+pub(super) const MATERIAL_SECTION_HEADER: Color32 = Color32::from_rgb(255, 255, 224);
+pub(super) const MATERIAL_PARAMETER_SECTIONS: &[&str] = &[
+    "ALBEDO",
+    "BUMP_MAPPING",
+    "MATERIAL_MODEL",
+    "ENVIRONMENT_MAPPING",
+    "SELF_ILLUMINATION",
+    "ATMOSPHERE PROPERTIES",
+    "MISC",
+];
+pub(super) const MAX_OPEN_TABS: usize = 32;
+pub(super) const MAX_PARSED_TAGS: usize = 24;
+pub(super) const MAX_BROWSER_ENTRIES_PER_NODE: usize = 500;
+pub(super) const FOUNDATION_LABEL_WIDTH: f32 = 280.0;

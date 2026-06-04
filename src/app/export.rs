@@ -1,0 +1,578 @@
+use super::*;
+
+pub(super) fn export_tag_json(
+    source: &TagSource,
+    entry: &TagEntry,
+    output: &Path,
+) -> anyhow::Result<String> {
+    let tag = read_entry(source, entry)?;
+    let value = tag_to_json(&tag, entry);
+    let text = serde_json::to_string_pretty(&value)?;
+    fs::write(output, text)?;
+    Ok(format!("Wrote JSON {}", output.display()))
+}
+
+pub(super) fn export_loose_folder_json(
+    root: &Path,
+    rel_path: &Path,
+    names: &TagNameIndex,
+    output: &Path,
+) -> anyhow::Result<String> {
+    let entries = scan_folder_subtree_entries(root, rel_path, names)?;
+    if entries.is_empty() {
+        anyhow::bail!("no tag files found in {}", root.join(rel_path).display());
+    }
+    let source = TagSource::LooseFolder {
+        root: root.to_path_buf(),
+    };
+    export_tag_json_entries(&source, &entries, output)
+}
+
+pub(super) fn export_tag_json_entries(
+    source: &TagSource,
+    entries: &[TagEntry],
+    output: &Path,
+) -> anyhow::Result<String> {
+    fs::create_dir_all(output)?;
+    let mut written = 0usize;
+    let mut failures = Vec::new();
+
+    for entry in entries {
+        let path = output.join(tag_json_relative_path(entry));
+        if let Some(parent) = path.parent() {
+            if let Err(error) = fs::create_dir_all(parent) {
+                failures.push(format!("{}: {error}", entry.display_path));
+                continue;
+            }
+        }
+
+        let result = (|| -> anyhow::Result<()> {
+            let tag = read_entry(source, entry)?;
+            let value = tag_to_json(&tag, entry);
+            let text = serde_json::to_string_pretty(&value)?;
+            fs::write(&path, text)?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => written += 1,
+            Err(error) => failures.push(format!("{}: {error}", entry.display_path)),
+        }
+    }
+
+    if written == 0 && !failures.is_empty() {
+        anyhow::bail!("failed to dump folder JSON: {}", failures.join("; "));
+    }
+    if written == 0 {
+        anyhow::bail!("no tag files found");
+    }
+
+    let mut message = format!("Wrote {written} JSON tag file(s) to {}", output.display());
+    if !failures.is_empty() {
+        message.push_str(&format!("; {} failed", failures.len()));
+    }
+    Ok(message)
+}
+
+pub(super) fn extract_raw_tag(
+    source: &TagSource,
+    entry: &TagEntry,
+    output: &Path,
+) -> anyhow::Result<String> {
+    let tag = read_entry(source, entry)?;
+    tag.write(output)?;
+    Ok(format!("Extracted raw tag {}", output.display()))
+}
+
+pub(super) fn extract_bitmap_images(
+    source: &TagSource,
+    entry: &TagEntry,
+    output: &Path,
+) -> anyhow::Result<String> {
+    let count = write_bitmap_images(source, entry, output)?;
+    Ok(format!(
+        "Extracted {count} bitmap image(s) to {}",
+        output.display()
+    ))
+}
+
+pub(super) fn extract_bitmap_entries(
+    source: &TagSource,
+    entries: &[TagEntry],
+    output: &Path,
+) -> anyhow::Result<String> {
+    fs::create_dir_all(output)?;
+    let mut total_images = 0usize;
+    let mut total_tags = 0usize;
+    let mut failures = Vec::new();
+    for entry in entries.iter().filter(|entry| is_bitmap_tag(entry)) {
+        let entry_output = output.join(tag_display_parent(entry));
+        match write_bitmap_images(source, entry, &entry_output) {
+            Ok(count) => {
+                total_images += count;
+                total_tags += 1;
+            }
+            Err(error) => failures.push(format!("{}: {error}", entry.display_path)),
+        }
+    }
+
+    if total_images == 0 && !failures.is_empty() {
+        anyhow::bail!("failed to extract bitmap tags: {}", failures.join("; "));
+    }
+    if total_images == 0 {
+        anyhow::bail!("no bitmap tags found");
+    }
+
+    let mut message = format!(
+        "Extracted {total_images} image(s) from {total_tags} bitmap tag(s) to {}",
+        output.display()
+    );
+    if !failures.is_empty() {
+        message.push_str(&format!("; {} failed", failures.len()));
+    }
+    Ok(message)
+}
+
+pub(super) fn write_bitmap_images(
+    source: &TagSource,
+    entry: &TagEntry,
+    output: &Path,
+) -> anyhow::Result<usize> {
+    let tag = read_entry(source, entry)?;
+    let bitmap = Bitmap::new(&tag)?;
+    if bitmap.is_empty() {
+        anyhow::bail!("bitmap tag has no images");
+    }
+    fs::create_dir_all(output)?;
+    let stem = tag_file_stem(entry);
+    let mut count = 0usize;
+    for (index, image) in bitmap.iter().enumerate() {
+        let suffix = if bitmap.len() == 1 {
+            String::new()
+        } else {
+            format!("_{index:02}")
+        };
+        let path = output.join(format!("{stem}{suffix}.tiff"));
+        let mut file = fs::File::create(&path)?;
+        image.write_tiff(&mut file)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+pub(super) fn extract_geometry_for_entry(
+    source: &TagSource,
+    entry: &TagEntry,
+    output: &Path,
+) -> anyhow::Result<String> {
+    match &entry.group_tag.to_be_bytes() {
+        b"hlmt" => extract_model_geometry(source, entry, output),
+        b"scnr" => run_shell_extraction(source, entry, "extract-geometry", output),
+        b"sbsp" => {
+            let tag = read_entry(source, entry)?;
+            let ass = AssFile::from_scenario_structure_bsp(&tag)?;
+            fs::create_dir_all(output)?;
+            let path = output.join(format!("{}.ASS", tag_file_stem(entry)));
+            let mut file = fs::File::create(&path)?;
+            ass.write(&mut file)?;
+            Ok(format!("Extracted BSP geometry {}", path.display()))
+        }
+        b"mode" => {
+            let tag = read_entry(source, entry)?;
+            fs::create_dir_all(output)?;
+            let stem = tag_file_stem(entry);
+            let jms = JmsFile::from_render_model(&tag)?;
+            let path = output.join(format!("{stem}.render.jms"));
+            let mut file = fs::File::create(&path)?;
+            jms.write(&mut file)?;
+            Ok(format!(
+                "Extracted render_model geometry {}",
+                path.display()
+            ))
+        }
+        b"coll" => {
+            let tag = read_entry(source, entry)?;
+            fs::create_dir_all(output)?;
+            let stem = tag_file_stem(entry);
+            let jms = JmsFile::from_collision_model(&tag)?;
+            let path = output.join(format!("{stem}.collision.jms"));
+            let mut file = fs::File::create(&path)?;
+            jms.write(&mut file)?;
+            Ok(format!(
+                "Extracted collision_model geometry {}",
+                path.display()
+            ))
+        }
+        b"phmo" => {
+            let tag = read_entry(source, entry)?;
+            fs::create_dir_all(output)?;
+            let stem = tag_file_stem(entry);
+            let jms = JmsFile::from_physics_model(&tag)?;
+            let path = output.join(format!("{stem}.physics.jms"));
+            let mut file = fs::File::create(&path)?;
+            jms.write(&mut file)?;
+            Ok(format!(
+                "Extracted physics_model geometry {}",
+                path.display()
+            ))
+        }
+        _ => anyhow::bail!(
+            "geometry extraction is not available for {}",
+            format_group_tag(entry.group_tag)
+        ),
+    }
+}
+
+pub(super) fn extract_model_geometry(
+    source: &TagSource,
+    entry: &TagEntry,
+    output: &Path,
+) -> anyhow::Result<String> {
+    let model = read_entry(source, entry)?;
+    let root = model.root();
+    let render_ref = tag_ref_path(&root, "render model");
+    let collision_ref = tag_ref_path(&root, "collision model");
+    let physics_ref =
+        tag_ref_path(&root, "physics_model").or_else(|| tag_ref_path(&root, "physics model"));
+    let stem = tag_file_stem(entry);
+    let mut emitted = Vec::new();
+    let mut skipped = Vec::new();
+
+    let render_tag = match render_ref.as_deref() {
+        Some(reference) => {
+            match load_referenced_tag_from_source(source, reference, "render_model", b"mode") {
+                Ok(tag) => Some(tag),
+                Err(error) => {
+                    skipped.push(format!("render: {error}"));
+                    None
+                }
+            }
+        }
+        None => {
+            skipped.push("render: no render_model reference".to_owned());
+            None
+        }
+    };
+
+    let render_jms_for_skeleton = match render_tag.as_ref() {
+        Some(tag) => match JmsFile::from_render_model(tag) {
+            Ok(jms) => Some(jms),
+            Err(error) => {
+                skipped.push(format!("render skeleton: {error}"));
+                None
+            }
+        },
+        None => None,
+    };
+    let skeleton = render_jms_for_skeleton
+        .as_ref()
+        .map(|jms| jms.nodes.as_slice());
+
+    if let Some(tag) = render_tag.as_ref() {
+        let render_dir = output.join("render");
+        fs::create_dir_all(&render_dir)?;
+        if render_model_prefers_ass(tag) {
+            let ass = AssFile::from_render_model(tag)?;
+            let path = render_dir.join(format!("{stem}.render.ASS"));
+            let mut file = fs::File::create(&path)?;
+            ass.write(&mut file)?;
+            emitted.push(format!("render {}", path.display()));
+        } else if let Some(jms) = render_jms_for_skeleton.as_ref() {
+            let path = render_dir.join(format!("{stem}.render.jms"));
+            let mut file = fs::File::create(&path)?;
+            jms.write(&mut file)?;
+            emitted.push(format!("render {}", path.display()));
+        }
+    }
+
+    match collision_ref.as_deref() {
+        Some(reference) => {
+            match load_referenced_tag_from_source(source, reference, "collision_model", b"coll") {
+                Ok(tag) => {
+                    let collision_dir = output.join("collision");
+                    fs::create_dir_all(&collision_dir)?;
+                    let jms = if let Some(skeleton) = skeleton {
+                        JmsFile::from_collision_model_with_skeleton(&tag, skeleton)?
+                    } else {
+                        JmsFile::from_collision_model(&tag)?
+                    };
+                    let path = collision_dir.join(format!("{stem}.collision.jms"));
+                    let mut file = fs::File::create(&path)?;
+                    jms.write(&mut file)?;
+                    emitted.push(format!("collision {}", path.display()));
+                }
+                Err(error) => skipped.push(format!("collision: {error}")),
+            }
+        }
+        None => skipped.push("collision: no collision_model reference".to_owned()),
+    }
+
+    match physics_ref.as_deref() {
+        Some(reference) => {
+            match load_referenced_tag_from_source(source, reference, "physics_model", b"phmo") {
+                Ok(tag) => {
+                    let physics_dir = output.join("physics");
+                    fs::create_dir_all(&physics_dir)?;
+                    let jms = if let Some(skeleton) = skeleton {
+                        JmsFile::from_physics_model_with_skeleton(&tag, skeleton)?
+                    } else {
+                        JmsFile::from_physics_model(&tag)?
+                    };
+                    let path = physics_dir.join(format!("{stem}.physics.jms"));
+                    let mut file = fs::File::create(&path)?;
+                    jms.write(&mut file)?;
+                    emitted.push(format!("physics {}", path.display()));
+                }
+                Err(error) => skipped.push(format!("physics: {error}")),
+            }
+        }
+        None => skipped.push("physics: no physics_model reference".to_owned()),
+    }
+
+    if emitted.is_empty() {
+        anyhow::bail!(
+            "model geometry extraction emitted nothing: {}",
+            skipped.join("; ")
+        );
+    }
+    let mut message = format!(
+        "Extracted {} model geometry file(s) to {}",
+        emitted.len(),
+        output.display()
+    );
+    if !skipped.is_empty() {
+        message.push_str(&format!("; skipped {}", skipped.join("; ")));
+    }
+    Ok(message)
+}
+
+pub(super) fn load_referenced_tag_from_source(
+    source: &TagSource,
+    reference: &str,
+    extension: &str,
+    group_tag: &[u8; 4],
+) -> anyhow::Result<TagFile> {
+    let group_tag = u32::from_be_bytes(*group_tag);
+    match source {
+        TagSource::LooseFolder { root } => {
+            let path = resolve_tag_path(root, reference, extension);
+            TagFile::read(&path)
+                .map_err(|error| anyhow::anyhow!("read {} failed: {error}", path.display()))
+        }
+        TagSource::SingleFile { path } => {
+            let root = derive_tags_root(path)
+                .or_else(|| path.parent().map(Path::to_path_buf))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("could not derive a tag root for {}", path.display())
+                })?;
+            let resolved = resolve_tag_path(&root, reference, extension);
+            TagFile::read(&resolved)
+                .map_err(|error| anyhow::anyhow!("read {} failed: {error}", resolved.display()))
+        }
+        TagSource::MonolithicCache { cache, .. } => cache
+            .read_tag_by_name(group_tag, reference)
+            .map_err(|error| anyhow::anyhow!("read {reference}.{extension} failed: {error}")),
+    }
+}
+
+pub(super) fn render_model_prefers_ass(tag: &TagFile) -> bool {
+    let root = tag.root();
+    let instance_mesh_index = root
+        .field("instance mesh index")
+        .and_then(|field| field.value())
+        .and_then(|value| match value {
+            TagFieldData::LongBlockIndex(index) => Some(index as i64),
+            TagFieldData::CustomLongBlockIndex(index) => Some(index as i64),
+            TagFieldData::ShortBlockIndex(index) => Some(index as i64),
+            TagFieldData::LongInteger(index) => Some(index as i64),
+            _ => None,
+        })
+        .unwrap_or(-1);
+    let placements_len = root
+        .field("instance placements")
+        .and_then(|field| field.as_block())
+        .map(|block| block.len())
+        .unwrap_or(0);
+    instance_mesh_index >= 0 && placements_len > 0
+}
+
+pub(super) fn run_shell_extraction(
+    source: &TagSource,
+    entry: &TagEntry,
+    command_name: &str,
+    output: &Path,
+) -> anyhow::Result<String> {
+    let shell = shell_binary_path()?;
+    let mut command = Command::new(&shell);
+    if let TagSource::MonolithicCache { root, .. } = source {
+        command.arg("--cache").arg(root);
+    }
+    command.arg(command_name);
+    command.arg(shell_entry_arg(entry)?);
+    if command_name == "extract-geometry" && entry.group_tag == u32::from_be_bytes(*b"hlmt") {
+        command.arg("all");
+    }
+    command.arg("--output").arg(output);
+    let output_data = command.output()?;
+    if !output_data.status.success() {
+        let stderr = String::from_utf8_lossy(&output_data.stderr);
+        let stdout = String::from_utf8_lossy(&output_data.stdout);
+        anyhow::bail!(
+            "{} failed: {}{}",
+            command_name,
+            stderr.trim(),
+            if stdout.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" {}", stdout.trim())
+            }
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output_data.stdout);
+    let message = stdout.lines().last().unwrap_or("").trim();
+    if message.is_empty() {
+        Ok(format!(
+            "{} completed into {}",
+            command_name,
+            output.display()
+        ))
+    } else {
+        Ok(format!("{command_name}: {message}"))
+    }
+}
+
+pub(super) fn shell_binary_path() -> anyhow::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    let file_name = if cfg!(windows) {
+        "blam-tag-shell.exe"
+    } else {
+        "blam-tag-shell"
+    };
+    if let Some(parent) = exe.parent() {
+        let sibling = parent.join(file_name);
+        if sibling.exists() {
+            return Ok(sibling);
+        }
+    }
+    let fallback = PathBuf::from("target").join("debug").join(file_name);
+    if fallback.exists() {
+        return Ok(fallback);
+    }
+    anyhow::bail!(
+        "could not find {file_name}; build the shell with `cargo build -p blam-tag-shell`"
+    )
+}
+
+pub(super) fn shell_entry_arg(entry: &TagEntry) -> anyhow::Result<PathBuf> {
+    match &entry.location {
+        TagEntryLocation::LooseFile(path) => Ok(path.clone()),
+        TagEntryLocation::Monolithic { name, group_tag } => Ok(PathBuf::from(format!(
+            "{}.{}",
+            name,
+            format_group_tag(*group_tag)
+        ))),
+    }
+}
+
+pub(super) fn tag_to_json(tag: &TagFile, entry: &TagEntry) -> Value {
+    json!({
+        "path": entry.display_path,
+        "group": format_group_tag(tag.group().tag),
+        "group_name": entry.group_name,
+        "version": tag.group().version,
+        "endian": match tag.endian {
+            Endian::Le => "LE",
+            Endian::Be => "BE",
+        },
+        "fields": struct_to_json(tag.root()),
+    })
+}
+
+pub(super) fn struct_to_json(tag_struct: TagStruct<'_>) -> Value {
+    Value::Array(tag_struct.fields().map(field_to_json).collect())
+}
+
+pub(super) fn field_to_json(field: TagField<'_>) -> Value {
+    if let Some(value) = field.value() {
+        return json!({
+            "name": clean_field_name(field.name()),
+            "type": field.type_name(),
+            "value": field_value_to_json(value),
+        });
+    }
+    if let Some(block) = field.as_block() {
+        let elements = block.iter().map(struct_to_json).collect::<Vec<_>>();
+        return json!({
+            "name": clean_field_name(field.name()),
+            "type": "block",
+            "count": block.len(),
+            "elements": elements,
+        });
+    }
+    if let Some(array) = field.as_array() {
+        let elements = array.iter().map(struct_to_json).collect::<Vec<_>>();
+        return json!({
+            "name": clean_field_name(field.name()),
+            "type": "array",
+            "count": array.len(),
+            "elements": elements,
+        });
+    }
+    if let Some(nested) = field.as_struct() {
+        return json!({
+            "name": clean_field_name(field.name()),
+            "type": "struct",
+            "fields": struct_to_json(nested),
+        });
+    }
+    if let Some(resource) = field.as_resource() {
+        return json!({
+            "name": clean_field_name(field.name()),
+            "type": "pageable_resource",
+            "kind": format!("{:?}", resource.kind()),
+            "inline_bytes": resource.inline_bytes().len(),
+            "exploded_payload_bytes": resource.exploded_payload().map(|payload| payload.len()),
+            "xsync_payload_bytes": resource.xsync_payload().map(|payload| payload.len()),
+            "header": resource.as_struct().map(struct_to_json),
+        });
+    }
+    json!({
+        "name": clean_field_name(field.name()),
+        "type": field.type_name(),
+    })
+}
+
+pub(super) fn field_value_to_json(value: TagFieldData) -> Value {
+    match value {
+        TagFieldData::String(s) | TagFieldData::LongString(s) => json!(s),
+        TagFieldData::StringId(s) | TagFieldData::OldStringId(s) => {
+            json!({ "string": s.string })
+        }
+        TagFieldData::TagReference(reference) => match reference.group_tag_and_name {
+            Some((group_tag, path)) => json!({
+                "group": format_group_tag(group_tag),
+                "path": path,
+            }),
+            None => Value::Null,
+        },
+        TagFieldData::CharInteger(v) => json!(v),
+        TagFieldData::ShortInteger(v) => json!(v),
+        TagFieldData::LongInteger(v) => json!(v),
+        TagFieldData::Int64Integer(v) => json!(v),
+        TagFieldData::ByteInteger(v) => json!(v),
+        TagFieldData::WordInteger(v) => json!(v),
+        TagFieldData::DwordInteger(v) => json!(v),
+        TagFieldData::QwordInteger(v) => json!(v),
+        TagFieldData::Tag(v) => json!(format_group_tag(v)),
+        TagFieldData::CharEnum { value, name } => json!({ "value": value, "name": name }),
+        TagFieldData::ShortEnum { value, name } => json!({ "value": value, "name": name }),
+        TagFieldData::LongEnum { value, name } => json!({ "value": value, "name": name }),
+        TagFieldData::ByteFlags { value, names } => json!({ "value": value, "names": names }),
+        TagFieldData::WordFlags { value, names } => json!({ "value": value, "names": names }),
+        TagFieldData::LongFlags { value, names } => json!({ "value": value, "names": names }),
+        TagFieldData::Data(bytes) => json!({ "bytes": bytes.len() }),
+        TagFieldData::ApiInterop(value) => json!({ "raw_bytes": value.raw.len() }),
+        TagFieldData::Custom(bytes) => json!({ "bytes": bytes.len() }),
+        other => json!(format!("{other:?}")),
+    }
+}

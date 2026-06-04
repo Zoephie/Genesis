@@ -1,0 +1,918 @@
+use super::*;
+
+/// A toolbar launcher button: shows the decoded `.ico` icon when available,
+/// otherwise falls back to a single-letter label. Returns the response so the
+/// caller can attach a hover tooltip and read `.clicked()`.
+fn launcher_button(
+    ui: &mut Ui,
+    icon: Option<&egui::TextureHandle>,
+    fallback: &str,
+    enabled: bool,
+) -> egui::Response {
+    match icon {
+        Some(texture) => ui.add_enabled(
+            enabled,
+            egui::ImageButton::new(egui::load::SizedTexture::new(
+                texture.id(),
+                Vec2::splat(20.0),
+            )),
+        ),
+        None => ui.add_enabled(
+            enabled,
+            egui::Button::new(fallback).min_size(Vec2::splat(22.0)),
+        ),
+    }
+}
+
+impl Genesis {
+    /// "Search fields" bar (Guerilla-style): typing a block or field name
+    /// collapses the editor to just the matching node(s) and their ancestors.
+    pub(super) fn draw_field_search_bar(&mut self, ui: &mut Ui, tag_key: &str) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Search fields:").color(text_dark()));
+            let query = self.field_search.entry(tag_key.to_owned()).or_default();
+            ui.add(
+                egui::TextEdit::singleline(query)
+                    .hint_text("block or field name")
+                    .desired_width(220.0),
+            );
+            if ui
+                .add(egui::Button::new("x").min_size(Vec2::new(22.0, 22.0)))
+                .on_hover_text("Clear search")
+                .clicked()
+            {
+                query.clear();
+            }
+        });
+        ui.add_space(4.0);
+    }
+
+    fn draw_tool_launcher_buttons(&mut self, ui: &mut Ui) {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add(egui::Button::new("B").min_size(Vec2::splat(22.0)))
+                .on_hover_text("Launch Blender")
+                .clicked()
+            {
+                self.launch_blender();
+            }
+
+            let tag_test_ready = self
+                .kit_tool_path(self.tag_test_executable())
+                .is_some_and(|path| path.is_file());
+            if launcher_button(ui, self.tag_test_icon.as_ref(), "T", tag_test_ready)
+                .on_hover_text("Launch tag_test")
+                .clicked()
+            {
+                self.launch_tag_test();
+            }
+
+            let sapien_ready = self
+                .kit_tool_path("sapien.exe")
+                .is_some_and(|path| path.is_file());
+            if launcher_button(ui, self.sapien_icon.as_ref(), "S", sapien_ready)
+                .on_hover_text("Launch Sapien")
+                .clicked()
+            {
+                self.launch_sapien();
+            }
+        });
+    }
+
+    fn draw_settings_window(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+
+        let mut open = self.settings_open;
+        egui::Window::new("Settings")
+            .id(egui::Id::new("app_settings"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Blender").color(text_dark()).strong());
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Path").color(subtle_dark()));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.blender_path_input)
+                            .desired_width(360.0),
+                    );
+                    if ui.button("Browse...").clicked() {
+                        self.choose_blender_path();
+                    }
+                });
+                ui.add_space(8.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Apply").clicked() {
+                        let trimmed = self.blender_path_input.trim();
+                        self.blender_path = if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(PathBuf::from(trimmed))
+                        };
+                        self.status = if let Some(path) = &self.blender_path {
+                            format!("Blender path set to {}", path.display())
+                        } else {
+                            "Blender path cleared".to_owned()
+                        };
+                    }
+                    if ui.button("Clear").clicked() {
+                        self.blender_path = None;
+                        self.blender_path_input.clear();
+                        self.status = "Blender path cleared".to_owned();
+                    }
+                });
+            });
+        self.settings_open = open;
+    }
+}
+
+impl eframe::App for Genesis {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.process_worker_messages();
+        set_dark_mode(self.dark_mode);
+        ctx.set_visuals(foundation_visuals());
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::S)) {
+            self.save_current_tag();
+        }
+
+        egui::TopBottomPanel::top("menu")
+            .frame(Frame::none().fill(menu_bar()).inner_margin(egui::Margin {
+                left: 6.0,
+                right: 6.0,
+                top: 2.0,
+                bottom: 2.0,
+            }))
+            .show(ctx, |ui| {
+                egui::menu::bar(ui, |ui| {
+                    ui.menu_button("File", |ui| {
+                        if ui.button("Load Tag...").clicked() {
+                            ui.close_menu();
+                            self.begin_load_single(ctx.clone());
+                        }
+                        if ui.button("Load Folder...").clicked() {
+                            ui.close_menu();
+                            self.begin_load_folder(ctx.clone());
+                        }
+                        if ui.button("Load Monolithic blob_index.dat...").clicked() {
+                            ui.close_menu();
+                            self.begin_load_monolithic(ctx.clone());
+                        }
+                        ui.separator();
+                        if ui.button("Save Current Tag    Ctrl+S").clicked() {
+                            ui.close_menu();
+                            self.save_current_tag();
+                        }
+                        // Regenerate Index: force a fresh full scan and
+                        // overwrite the cached index file.
+                        let can_regen = self
+                            .source
+                            .as_ref()
+                            .map(|s| {
+                                matches!(s.source, TagSource::LooseFolder { .. })
+                                    && s.game.is_some()
+                            })
+                            .unwrap_or(false);
+                        if ui
+                            .add_enabled(
+                                can_regen && !self.scanning_entries,
+                                egui::Button::new("Regenerate Index"),
+                            )
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            // Clear cached entries so the scan runs fresh.
+                            if let Some(s) = self.source.as_mut() {
+                                s.all_entries.clear();
+                                s.group_tree = crate::source::build_group_tree(&[]);
+                            }
+                            self.begin_scan_all_entries(ctx.clone());
+                        }
+                        ui.separator();
+                        if ui.button("Settings...").clicked() {
+                            self.settings_open = true;
+                            ui.close_menu();
+                        }
+                    });
+                    ui.menu_button("View", |ui| {
+                        if ui
+                            .selectable_label(self.browser_mode == BrowserMode::Folders, "Folders")
+                            .clicked()
+                        {
+                            self.browser_mode = BrowserMode::Folders;
+                            ui.close_menu();
+                        }
+                        if ui
+                            .selectable_label(
+                                self.browser_mode == BrowserMode::Groups,
+                                "Tag Groups",
+                            )
+                            .clicked()
+                        {
+                            self.browser_mode = BrowserMode::Groups;
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        ui.checkbox(&mut self.show_browser_prefixes, "Show [tag]/[folder]");
+                        ui.checkbox(&mut self.expert_mode, "Expert mode");
+                        ui.checkbox(&mut self.dark_mode, "Dark mode");
+                        ui.separator();
+                        let terminal_enabled = self.terminal_work_dir.is_some();
+                        if ui
+                            .add_enabled(
+                                terminal_enabled,
+                                egui::SelectableLabel::new(self.terminal_open, "Terminal"),
+                            )
+                            .clicked()
+                        {
+                            self.terminal_open = !self.terminal_open;
+                            self.remember_terminal_open_for_game();
+                            ui.close_menu();
+                        }
+                    });
+                    self.draw_tool_launcher_buttons(ui);
+                });
+            });
+
+        egui::TopBottomPanel::bottom("status")
+            .frame(Frame::none().fill(menu_bar()).inner_margin(egui::Margin {
+                left: 6.0,
+                right: 6.0,
+                top: 2.0,
+                bottom: 2.0,
+            }))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Status").strong());
+                    ui.separator();
+                    ui.label(&self.status);
+                });
+            });
+
+        // Terminal panel — rendered AFTER status so it sits above it.
+        if self.terminal_open {
+            let work_dir_label = self
+                .terminal_work_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            egui::TopBottomPanel::bottom("terminal")
+                .resizable(true)
+                .default_height(180.0)
+                .height_range(90.0..=600.0)
+                .frame(
+                    Frame::none()
+                        .fill(foundation_group_bg())
+                        .inner_margin(egui::Margin {
+                            left: 6.0,
+                            right: 6.0,
+                            top: 4.0,
+                            bottom: 4.0,
+                        }),
+                )
+                .show(ctx, |ui| {
+                    // Header pinned to the top of the panel.
+                    egui::TopBottomPanel::top("terminal_header")
+                        .frame(Frame::none())
+                        .show_inside(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.strong(RichText::new("Terminal").color(text_dark()));
+                                ui.small(
+                                    RichText::new(&work_dir_label)
+                                        .color(subtle_dark())
+                                        .monospace(),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .small_button("×")
+                                            .on_hover_text("Close terminal")
+                                            .clicked()
+                                        {
+                                            self.terminal_open = false;
+                                            self.remember_terminal_open_for_game();
+                                        }
+                                        if ui.small_button("Clear").clicked() {
+                                            self.terminal.lines.clear();
+                                        }
+                                        if self.terminal.running {
+                                            ui.small(
+                                                RichText::new("running…").color(subtle_dark()),
+                                            );
+                                        }
+                                    },
+                                );
+                            });
+                            ui.add_space(2.0);
+                        });
+
+                    // Input row pinned to the bottom of the panel.
+                    egui::TopBottomPanel::bottom("terminal_input")
+                        .frame(Frame::none())
+                        .show_inside(ui, |ui| {
+                            ui.add_space(2.0);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(">").monospace().color(subtle_dark()));
+                                // Reserve a fixed width for the Run button on
+                                // the right; the TextEdit fills the rest. (Do
+                                // NOT wrap the button in a right_to_left layout
+                                // — that consumes all remaining width and leaves
+                                // nothing for the input field.)
+                                let button_w = 52.0;
+                                let text_w = (ui.available_width() - button_w - 8.0).max(40.0);
+                                let resp = ui.add_enabled(
+                                    !self.terminal.running,
+                                    egui::TextEdit::singleline(&mut self.terminal.input)
+                                        .desired_width(text_w)
+                                        .font(egui::TextStyle::Monospace)
+                                        .hint_text("tool <command> …"),
+                                );
+                                let run_clicked = ui
+                                    .add_enabled(!self.terminal.running, egui::Button::new("Run"))
+                                    .clicked();
+                                let enter = resp.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                if run_clicked || enter {
+                                    self.begin_terminal_command(ctx.clone());
+                                    // Refocus the input so the user can keep typing.
+                                    resp.request_focus();
+                                }
+                            });
+                        });
+
+                    // Output fills the remaining center space. The CentralPanel
+                    // bounds the scroll area exactly, so there's no available_height
+                    // feedback to fight the resize handle.
+                    egui::CentralPanel::default()
+                        .frame(
+                            Frame::none()
+                                .fill(Color32::from_rgb(24, 24, 23))
+                                .inner_margin(egui::Margin {
+                                    left: 6.0,
+                                    right: 6.0,
+                                    top: 4.0,
+                                    bottom: 4.0,
+                                }),
+                        )
+                        .show_inside(ui, |ui| {
+                            let want_scroll_bottom = self.terminal.scroll_to_bottom;
+                            self.terminal.scroll_to_bottom = false;
+                            egui::ScrollArea::vertical()
+                                .id_salt("terminal_output")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    for line in &self.terminal.lines {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(line)
+                                                    .monospace()
+                                                    .font(FontId::monospace(13.0))
+                                                    .color(Color32::from_rgb(232, 232, 228)),
+                                            )
+                                            .wrap(),
+                                        );
+                                    }
+                                    if want_scroll_bottom {
+                                        ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+                                    }
+                                });
+                        });
+                });
+        }
+
+        egui::SidePanel::left("tag_browser")
+            .resizable(true)
+            .default_width(330.0)
+            .frame(Frame::none().fill(left_panel()).inner_margin(egui::Margin {
+                left: 8.0,
+                right: 8.0,
+                top: 6.0,
+                bottom: 6.0,
+            }))
+            .show(ctx, |ui| {
+                ui.heading(RichText::new("Tags").color(text_dark()));
+                if let Some(source) = &mut self.source {
+                    ui.label(
+                        RichText::new(&source.label)
+                            .color(foundation_blue())
+                            .strong(),
+                    );
+                    ui.small(RichText::new(source.source.origin_label()).color(subtle_dark()));
+                    ui.add_space(8.0);
+                    let scanning = self.scanning_entries;
+                    // Collect deferred scan-trigger here; execute after borrow ends.
+                    let mut need_scan = false;
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut self.browser_mode,
+                            BrowserMode::Folders,
+                            "Folders",
+                        );
+                        let groups_btn = ui.selectable_value(
+                            &mut self.browser_mode,
+                            BrowserMode::Groups,
+                            "Groups",
+                        );
+                        if groups_btn.clicked()
+                            && matches!(source.source, TagSource::LooseFolder { .. })
+                            && source.all_entries.is_empty()
+                            && !scanning
+                        {
+                            need_scan = true;
+                        }
+                    });
+                    ui.checkbox(&mut self.show_browser_prefixes, "Show prefixes");
+                    ui.add_space(6.0);
+                    let prev_filter_empty = self.filter.is_empty();
+                    ui.scope(|ui| {
+                        ui.visuals_mut().override_text_color = Some(text_dark());
+                        let search_bg = if is_dark_mode() {
+                            Color32::from_rgb(48, 48, 46)
+                        } else {
+                            Color32::from_rgb(246, 246, 244)
+                        };
+                        let search_hover = if is_dark_mode() {
+                            Color32::from_rgb(58, 58, 55)
+                        } else {
+                            Color32::from_rgb(255, 255, 252)
+                        };
+                        ui.visuals_mut().extreme_bg_color = search_bg;
+                        ui.visuals_mut().widgets.inactive.bg_fill = search_bg;
+                        ui.visuals_mut().widgets.hovered.bg_fill = search_hover;
+                        ui.visuals_mut().widgets.active.bg_fill = search_hover;
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.filter)
+                                .hint_text("search tags")
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+                    if prev_filter_empty
+                        && !self.filter.is_empty()
+                        && matches!(source.source, TagSource::LooseFolder { .. })
+                        && source.all_entries.is_empty()
+                        && !scanning
+                    {
+                        need_scan = true;
+                    }
+                    ui.add_space(4.0);
+                    let selected = self.selected_key.clone();
+                    let filter = self.filter.trim().to_owned();
+                    let mode = self.browser_mode;
+                    let show_prefixes = self.show_browser_prefixes;
+                    let mut status_update = None;
+                    // Groups and filtered Folders use all_entries (background
+                    // scan) so every tag is visible, not just visited folders.
+                    let has_all = !source.all_entries.is_empty();
+                    let groups_mode = matches!(mode, BrowserMode::Groups);
+                    let action = if !filter.is_empty() {
+                        // Active search: render a *pruned* tree containing only
+                        // the matching tags, with folders collapsed so the user
+                        // drills down to find them. The pruned tree is memoized
+                        // in `filter_cache` (rebuilt once per keystroke, not per
+                        // frame), and collapsed folders don't build their
+                        // children — so per-frame cost stays bounded.
+                        let entries: &[TagEntry] = if has_all {
+                            &source.all_entries
+                        } else {
+                            &source.entries
+                        };
+                        if scanning && !has_all {
+                            ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new("Indexing tags…")
+                                            .color(subtle_dark())
+                                            .small(),
+                                    );
+                                    None
+                                })
+                                .inner
+                        } else {
+                            self.filter_cache.refresh(
+                                self.source_generation,
+                                &filter,
+                                entries,
+                                has_all,
+                                groups_mode,
+                            );
+                            let cache = &self.filter_cache;
+                            ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    if cache.entries.is_empty() {
+                                        ui.label(
+                                            RichText::new("No matching tags").color(subtle_dark()),
+                                        );
+                                        return None;
+                                    }
+                                    // Empty filter → tree renders every (already
+                                    // pruned) entry with folders collapsed.
+                                    draw_tree(
+                                        ui,
+                                        &cache.tree,
+                                        &cache.entries,
+                                        selected.as_deref(),
+                                        "",
+                                        show_prefixes,
+                                        groups_mode,
+                                    )
+                                })
+                                .inner
+                        }
+                    } else {
+                        ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| match mode {
+                                BrowserMode::Folders => {
+                                    if let TagSource::LooseFolder { root } = &source.source {
+                                        let root = root.clone();
+                                        draw_tree_lazy(
+                                            ui,
+                                            &mut source.tree,
+                                            &mut source.entries,
+                                            &mut source.group_tree,
+                                            &root,
+                                            &source.names,
+                                            selected.as_deref(),
+                                            &filter,
+                                            show_prefixes,
+                                            &mut status_update,
+                                        )
+                                    } else {
+                                        draw_tree(
+                                            ui,
+                                            &source.tree,
+                                            &source.entries,
+                                            selected.as_deref(),
+                                            &filter,
+                                            show_prefixes,
+                                            false,
+                                        )
+                                    }
+                                }
+                                BrowserMode::Groups => {
+                                    if scanning && !has_all {
+                                        ui.label(
+                                            RichText::new("Indexing tags…")
+                                                .color(subtle_dark())
+                                                .small(),
+                                        );
+                                        None
+                                    } else {
+                                        let entries = if has_all {
+                                            &source.all_entries[..]
+                                        } else {
+                                            &source.entries[..]
+                                        };
+                                        draw_tree(
+                                            ui,
+                                            &source.group_tree,
+                                            entries,
+                                            selected.as_deref(),
+                                            &filter,
+                                            show_prefixes,
+                                            true,
+                                        )
+                                    }
+                                }
+                            })
+                            .inner
+                    };
+                    if let Some(status) = status_update {
+                        self.status = status;
+                    }
+                    if let Some(action) = action {
+                        self.handle_browser_action(action, ctx.clone());
+                    }
+                    // Deferred: begin_scan_all_entries needs &mut self, so
+                    // it must be called after the `source` borrow ends.
+                    if need_scan {
+                        self.begin_scan_all_entries(ctx.clone());
+                    }
+                } else {
+                    ui.label("Use File to load a tag, folder, or monolithic cache.");
+                }
+            });
+
+        egui::CentralPanel::default()
+            .frame(Frame::none().fill(editor_bg()).inner_margin(egui::Margin {
+                left: 10.0,
+                right: 10.0,
+                top: 8.0,
+                bottom: 8.0,
+            }))
+            .show(ctx, |ui| {
+                if !self.open_tabs.is_empty() || self.dragging_floating_tab.is_some() {
+                    let mut close_key = None;
+                    let mut pop_key = None;
+                    let mut close_all = false;
+                    let mut close_all_but = None;
+                    let mut rack_rect = None;
+                    if self.open_tabs.is_empty() {
+                        let response = ui.label(
+                            RichText::new("Drop popped tag here")
+                                .color(subtle_dark())
+                                .strong(),
+                        );
+                        rack_rect = Some(response.rect);
+                    } else {
+                        const TAB_LABEL_WIDTH: f32 = 170.0;
+                        const TAB_WIDTH: f32 = 248.0;
+
+                        let available_width = ui.available_width().max(TAB_WIDTH);
+                        let row_gap = ui.spacing().item_spacing.x;
+                        let mut rows = Vec::<Vec<(String, String, bool)>>::new();
+                        let mut row = Vec::new();
+                        let mut row_width = 0.0;
+
+                        for key in self.open_tabs.clone() {
+                            let Some(entry) = self.entry_for_key(&key) else {
+                                continue;
+                            };
+                            let active = self.selected_key.as_deref() == Some(key.as_str());
+                            let dirty = self
+                                .parsed_tags
+                                .get(&key)
+                                .map(|doc| doc.dirty)
+                                .unwrap_or(false);
+                            let label = if dirty {
+                                format!("● {}", tag_tab_label(entry))
+                            } else {
+                                tag_tab_label(entry)
+                            };
+                            let next_width = if row.is_empty() {
+                                TAB_WIDTH
+                            } else {
+                                row_width + row_gap + TAB_WIDTH
+                            };
+                            if !row.is_empty() && next_width > available_width {
+                                rows.push(row);
+                                row = Vec::new();
+                                row_width = 0.0;
+                            }
+                            if !row.is_empty() {
+                                row_width += row_gap;
+                            }
+                            row_width += TAB_WIDTH;
+                            row.push((key, label, active));
+                        }
+                        if !row.is_empty() {
+                            rows.push(row);
+                        }
+
+                        for row in rows {
+                            let row_response = ui.horizontal(|ui| {
+                                for (key, label, active) in row {
+                                    let shown_label = truncate_for_cell(&label, TAB_LABEL_WIDTH);
+                                    let fill = if active { menu_bar() } else { row_type() };
+                                    Frame::none()
+                                        .fill(fill)
+                                        .stroke(Stroke::new(1.0, grid_line()))
+                                        .inner_margin(egui::Margin {
+                                            left: 6.0,
+                                            right: 4.0,
+                                            top: 3.0,
+                                            bottom: 3.0,
+                                        })
+                                        .show(ui, |ui| {
+                                            ui.set_width(TAB_WIDTH);
+                                            ui.horizontal(|ui| {
+                                                let label_response = ui
+                                                    .add_sized(
+                                                        Vec2::new(TAB_LABEL_WIDTH, 20.0),
+                                                        egui::SelectableLabel::new(
+                                                            active,
+                                                            RichText::new(shown_label.clone())
+                                                                .color(text_dark())
+                                                                .strong(),
+                                                        ),
+                                                    )
+                                                    .on_hover_text(label.clone());
+                                                if label_response.clicked() {
+                                                    self.selected_key = Some(key.clone());
+                                                    self.ensure_tag_loading(
+                                                        key.clone(),
+                                                        ctx.clone(),
+                                                    );
+                                                }
+                                                label_response.context_menu(|ui| {
+                                                    if ui.button("Close all").clicked() {
+                                                        close_all = true;
+                                                        ui.close_menu();
+                                                    }
+                                                    if ui.button("Close all but this").clicked() {
+                                                        close_all_but = Some(key.clone());
+                                                        ui.close_menu();
+                                                    }
+                                                });
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new("pop")
+                                                            .min_size(Vec2::new(30.0, 18.0)),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    pop_key = Some(key.clone());
+                                                }
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new("x")
+                                                            .min_size(Vec2::new(18.0, 18.0)),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    close_key = Some(key.clone());
+                                                }
+                                            });
+                                        });
+                                }
+                            });
+                            rack_rect = Some(match rack_rect {
+                                Some(rect) => rect.union(row_response.response.rect),
+                                None => row_response.response.rect,
+                            });
+                        }
+                    }
+                    if close_all {
+                        self.close_all_tabs();
+                    } else if let Some(key) = close_all_but {
+                        self.close_all_tabs_but(&key);
+                    } else if let Some(key) = close_key {
+                        self.close_tab(&key);
+                    } else if let Some(key) = pop_key {
+                        self.pop_tab(&key);
+                    }
+                    self.tab_rack_rect = rack_rect;
+                    ui.add_space(6.0);
+                } else {
+                    self.tab_rack_rect = None;
+                }
+
+                if let Some(entry) = self.selected_entry().cloned() {
+                    let selected_key = entry.key.clone();
+                    draw_entry_header(ui, &entry, &self.names);
+
+                    // "Search fields" collapses the editor to matching blocks.
+                    // Not offered for shader/sound tags (their own surfaces).
+                    let supports_field_search = supports_field_search(&entry);
+                    if supports_field_search {
+                        self.draw_field_search_bar(ui, &selected_key);
+                    }
+
+                    if let Some(doc) = self.parsed_tags.get_mut(&selected_key) {
+                        let mut pending = Vec::new();
+                        let mut block_ops = Vec::new();
+                        let mut shader_ops = Vec::new();
+                        let mut shader_param_ops = Vec::new();
+                        let mut color_request = None;
+                        let mut block_clip_request = None;
+                        let field_filter = compute_pending_field_filter(
+                            &doc.tag,
+                            supports_field_search,
+                            &selected_key,
+                            &self.field_search,
+                            &mut self.field_search_applied,
+                        );
+                        let mut edit_context = FieldEditContext {
+                            view_scope: "docked",
+                            tag_key: &selected_key,
+                            group_tag: entry.group_tag,
+                            tags_root: self.source.as_ref().and_then(|source| {
+                                match &source.source {
+                                    TagSource::LooseFolder { root } => Some(root.as_path()),
+                                    _ => None,
+                                }
+                            }),
+                            editable: is_editable_tag(&entry, &doc.tag),
+                            buffers: &mut self.edit_buffers,
+                            pending: &mut pending,
+                            block_ops: &mut block_ops,
+                            block_confirm: &mut self.block_confirm,
+                            open_request: &mut self.pending_open,
+                            tool_import: &mut self.pending_tool_import,
+                            shader_ops: &mut shader_ops,
+                            shader_param_ops: &mut shader_param_ops,
+                            color_request: &mut color_request,
+                            block_clipboard: self.block_clipboard.as_ref(),
+                            block_clip_request: &mut block_clip_request,
+                            field_filter: field_filter.as_ref(),
+                        };
+                        if is_bitmap_tag(&entry) {
+                            let preview = self
+                                .bitmap_previews
+                                .entry(selected_key.clone())
+                                .or_default();
+                            draw_bitmap_tag(
+                                ui,
+                                ctx,
+                                &doc.tag,
+                                &entry,
+                                &self.names,
+                                &mut self.color_popup,
+                                preview,
+                                self.expert_mode,
+                                &mut edit_context,
+                            );
+                        } else {
+                            draw_tag(
+                                ui,
+                                &doc.tag,
+                                &entry,
+                                &self.names,
+                                self.source.as_ref().map(|source| &source.source),
+                                &mut self.rmdf_cache,
+                                &mut self.rmop_cache,
+                                &mut self.color_popup,
+                                &mut self.function_popup,
+                                self.expert_mode,
+                                &mut edit_context,
+                            );
+                        }
+                        if let Some(status) =
+                            apply_pending_edits(&mut doc.tag, pending, &mut doc.dirty)
+                        {
+                            self.status = status;
+                        }
+                        if let Some(status) =
+                            apply_block_ops(&mut doc.tag, block_ops, &mut doc.dirty)
+                        {
+                            self.status = status;
+                        }
+                        if let Some(status) =
+                            apply_shader_ops(&mut doc.tag, shader_ops, &mut doc.dirty)
+                        {
+                            self.status = status;
+                        }
+                        if let Some(status) =
+                            apply_shader_param_ops(&mut doc.tag, shader_param_ops, &mut doc.dirty)
+                        {
+                            self.status = status;
+                        }
+                        // A color swatch was clicked: open the shared picker.
+                        if let Some(popup) = color_request {
+                            self.color_popup = Some(popup);
+                        }
+                        // Element(s) were copied: stash them on the clipboard.
+                        if let Some(clip) = block_clip_request {
+                            self.status = format!(
+                                "Copied {} '{}' element(s)",
+                                clip.elements.len(),
+                                clip.label
+                            );
+                            self.block_clipboard = Some(clip);
+                        }
+                    } else if self.loading_tags.contains(&selected_key) {
+                        ui.label("Loading tag data...");
+                    } else {
+                        ui.label("Select the tag again to load it.");
+                    }
+                } else {
+                    ui.heading("No tag selected");
+                    ui.label("Load a source from File, then select a tag in the browser.");
+                }
+            });
+        self.draw_settings_window(ctx);
+        self.persist_prefs_if_changed();
+        self.draw_floating_tabs(ctx);
+        self.handle_floating_tab_drop(ctx);
+        if let Some(result) = draw_color_popup(ctx, &mut self.color_popup) {
+            match result {
+                ColorPopupResult::FieldEdit { tag_key, edit } => {
+                    if let Some(doc) = self.parsed_tags.get_mut(&tag_key) {
+                        if let Some(status) =
+                            apply_pending_edits(&mut doc.tag, vec![edit], &mut doc.dirty)
+                        {
+                            self.status = status;
+                        }
+                    }
+                }
+                ColorPopupResult::ShaderOp { tag_key, op } => {
+                    if let Some(doc) = self.parsed_tags.get_mut(&tag_key) {
+                        if let Some(status) =
+                            apply_shader_ops(&mut doc.tag, vec![op], &mut doc.dirty)
+                        {
+                            self.status = status;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(batch) = draw_function_popup(ctx, &mut self.function_popup) {
+            if let Some(doc) = self.parsed_tags.get_mut(&batch.tag_key) {
+                if let Some(status) = apply_pending_edits(&mut doc.tag, batch.edits, &mut doc.dirty)
+                {
+                    self.status = status;
+                }
+            }
+        }
+        self.handle_block_confirm(ctx);
+        self.process_pending_open(ctx);
+        self.process_pending_tool_import(ctx);
+    }
+}

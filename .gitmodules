@@ -1,0 +1,4 @@
+[submodule "blam-tags"]
+	path = blam-tags
+	url = https://github.com/Zoephie/blam-tags.git
+	branch = back

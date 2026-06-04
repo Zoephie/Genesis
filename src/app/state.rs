@@ -1,0 +1,406 @@
+use super::*;
+
+pub(super) enum WorkerMessage {
+    SourceLoaded(Result<LoadedSourceData, String>),
+    TagLoaded {
+        key: String,
+        result: Result<TagFile, String>,
+    },
+    ExportFinished(Result<String, String>),
+    // Full recursive entry scan finished for a loose-folder source.
+    AllEntriesScanned(Result<Vec<TagEntry>, String>),
+    // One line of streamed terminal output.
+    TerminalLine(String),
+    // Terminal process finished.
+    TerminalDone,
+}
+
+pub(super) struct TerminalState {
+    pub(super) input: String,
+    pub(super) lines: Vec<String>,
+    pub(super) running: bool,
+    pub(super) scroll_to_bottom: bool,
+}
+
+pub(super) enum BrowserAction {
+    Select(String),
+    DumpJson(String),
+    OpenInExplorer(String),
+    DumpLoadedFolderJson(Vec<String>),
+    DumpLooseFolderJson { rel_path: PathBuf, label: String },
+    ExtractRaw(String),
+    ExtractBitmap(String),
+    ExtractBitmapFolder(Vec<String>),
+    ExtractGeometry(String),
+    ExtractImportInfo(String),
+    ExtractAnimation(String),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum BrowserMode {
+    Folders,
+    Groups,
+}
+
+/// Memoized search results for the tag browser.
+///
+/// Filtering the full tag set (100k+ entries) and lowercasing each name is far
+/// too expensive to redo every frame while the user types or scrolls. This
+/// caches a *pruned* tree containing only the matching tags (in folder- or
+/// group-hierarchy form) and only rebuilds it when the query, the source
+/// generation, the entry universe (`all_entries` vs `entries`), or the browser
+/// mode actually changes — see [`FilterCache::refresh`].
+///
+/// The pruned tree is rendered with folders collapsed, so the user drills down
+/// the same way as the unfiltered tree; collapsed headers don't build their
+/// children, which keeps per-frame cost bounded to what's actually expanded.
+#[derive(Default)]
+pub(super) struct FilterCache {
+    /// `source_generation` the cached tree was built for.
+    generation: u64,
+    /// The (trimmed) query string the tree was built for.
+    query: String,
+    /// Whether matches came from `all_entries` (true) or `entries` (false).
+    used_all: bool,
+    /// Whether the cached tree is grouped by tag group (true) or by folder.
+    groups: bool,
+    /// The matching entries (cloned subset of the source), referenced by index
+    /// from [`tree`]. Kept owned so rendering needs no borrow of the source.
+    pub(super) entries: Vec<TagEntry>,
+    /// Pruned hierarchy over [`entries`] — folder tree or group tree per mode.
+    pub(super) tree: TagTree,
+}
+
+impl FilterCache {
+    /// Rebuild the pruned match tree if anything it depends on changed;
+    /// otherwise reuse the cached tree.
+    pub(super) fn refresh(
+        &mut self,
+        generation: u64,
+        query: &str,
+        entries: &[TagEntry],
+        used_all: bool,
+        groups: bool,
+    ) {
+        if self.generation == generation
+            && self.query == query
+            && self.used_all == used_all
+            && self.groups == groups
+        {
+            return;
+        }
+        self.generation = generation;
+        self.query = query.to_owned();
+        self.used_all = used_all;
+        self.groups = groups;
+        self.entries = compute_filter_matches(entries, query)
+            .into_iter()
+            .map(|index| entries[index].clone())
+            .collect();
+        self.tree = if groups {
+            crate::source::build_group_tree(&self.entries)
+        } else {
+            crate::source::build_tree(&self.entries)
+        };
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct GuiPrefs {
+    pub(super) browser_mode: BrowserMode,
+    pub(super) show_browser_prefixes: bool,
+    pub(super) expert_mode: bool,
+    pub(super) dark_mode: bool,
+    pub(super) blender_path: Option<PathBuf>,
+}
+
+pub(super) struct TagDocument {
+    pub(super) tag: TagFile,
+    pub(super) dirty: bool,
+}
+
+impl TagDocument {
+    pub(super) fn clean(tag: TagFile) -> Self {
+        Self { tag, dirty: false }
+    }
+}
+
+pub(super) struct PendingFieldEdit {
+    pub(super) path: String,
+    pub(super) input: String,
+}
+
+/// A deferred structural edit to a block (add/insert/duplicate/delete),
+/// applied to the tag after the immutable render borrow ends.
+#[derive(Clone)]
+pub(super) enum BlockOpKind {
+    Add,
+    Insert(usize),
+    Duplicate(usize),
+    Delete(usize),
+    DeleteAll,
+    /// Insert copied element(s) at the given index.
+    Paste {
+        at: usize,
+        elements: Vec<blam_tags::TagBlockElement>,
+    },
+    /// Replace the element at `at` with the copied element(s).
+    ReplaceElement {
+        at: usize,
+        elements: Vec<blam_tags::TagBlockElement>,
+    },
+    /// Clear the block and fill it with the copied element(s).
+    ReplaceBlock {
+        elements: Vec<blam_tags::TagBlockElement>,
+    },
+}
+
+#[derive(Clone)]
+pub(super) struct BlockOp {
+    pub(super) path: String,
+    pub(super) kind: BlockOpKind,
+}
+
+/// A copied block element, held on the app so it can be pasted into a block of
+/// the same shape in another open tag. `group_tag` + `block_path` gate which
+/// blocks accept the paste (same group, same block); the library re-validates
+/// element compatibility before inserting.
+#[derive(Clone)]
+pub(super) struct BlockClipboard {
+    pub(super) group_tag: u32,
+    pub(super) block_path: String,
+    /// Human label for the menu, e.g. "initial permutation".
+    pub(super) label: String,
+    /// One element (Copy element) or every element (Copy entire block).
+    pub(super) elements: Vec<blam_tags::TagBlockElement>,
+}
+
+/// A pending destructive block op awaiting user confirmation. Lives on the
+/// app (persists across frames) and is shown as a modal.
+pub(super) struct BlockConfirm {
+    pub(super) tag_key: String,
+    pub(super) path: String,
+    pub(super) kind: BlockOpKind,
+    pub(super) message: String,
+    /// Label for the confirm button (e.g. "Delete", "Replace").
+    pub(super) confirm_label: String,
+}
+
+/// A request to open a referenced tag in a new tab (from an "Open" button on
+/// a tag-reference row). Resolved against the loose-folder tags root.
+#[derive(Clone)]
+pub(super) struct OpenTagRequest {
+    pub(super) group_tag: u32,
+    pub(super) rel_path: String,
+}
+
+/// A request to (re)import a geometry tag via `tool` (from the Import button on
+/// a render/collision/physics-model or animation-graph reference).
+#[derive(Clone)]
+pub(super) struct ToolImportRequest {
+    /// `tool` verb: "render" / "collision" / "physics" /
+    /// "model-animations-uncompressed".
+    pub(super) verb: &'static str,
+    /// Source directory argument, e.g. `objects\characters\masterchief`.
+    pub(super) source_dir: String,
+}
+
+/// A deferred shader mutation: append one `animated parameters[]` element to
+/// the given block path, then initialise its `type` and `function/data`
+/// fields. Applied after the frame's draw pass, like `BlockOp`, but in its
+/// own pass so the add + field init can be done atomically.
+#[derive(Clone)]
+pub(super) struct ShaderOp {
+    /// Absolute path to the `animated parameters` block, e.g.
+    /// `render_method/parameters[2]/animated parameters`.
+    pub(super) animated_block_path: String,
+    /// Output channel index (`RenderMethodAnimatedParameterType as i32`).
+    pub(super) output_type_index: i32,
+    /// Hex-encoded initial `mapping_function` blob for `function/data`.
+    pub(super) initial_function_hex: String,
+}
+
+/// A deferred shader mutation: create a new `parameters[]` element, set its
+/// `parameter name` and `real` value. Used when the user edits a shader
+/// parameter that has no existing instance in the tag.
+#[derive(Clone)]
+pub(super) struct ShaderParamOp {
+    /// Absolute path to the `parameters` block, e.g. `render_method/parameters`.
+    pub(super) parameters_block_path: String,
+    /// The parameter name to write into the new element's `parameter name`.
+    pub(super) parameter_name: String,
+    /// The real value to write into the new element's `real` field.
+    pub(super) real_value: f32,
+}
+
+/// What the user clicked in a block header this frame.
+#[derive(Default)]
+pub(super) struct BlockHeaderActions {
+    pub(super) add: bool,
+    pub(super) insert: bool,
+    pub(super) duplicate: bool,
+    pub(super) delete: bool,
+    pub(super) delete_all: bool,
+    pub(super) new_selection: Option<usize>,
+    /// Right-click → "Copy element" on the selected element.
+    pub(super) copy: bool,
+    /// Right-click → "Copy entire block".
+    pub(super) copy_block: bool,
+    /// Right-click → "Paste" (insert clipboard element(s) after the selection).
+    pub(super) paste: bool,
+    /// Right-click → "Replace selected element" with the clipboard.
+    pub(super) replace_element: bool,
+    /// Right-click → "Replace entire block" with the clipboard.
+    pub(super) replace_block: bool,
+}
+
+pub(super) struct FieldEditContext<'a> {
+    pub(super) view_scope: &'a str,
+    pub(super) tag_key: &'a str,
+    /// Group tag of the tag being rendered — gates block paste compatibility.
+    pub(super) group_tag: u32,
+    pub(super) tags_root: Option<&'a Path>,
+    pub(super) editable: bool,
+    pub(super) buffers: &'a mut HashMap<String, String>,
+    pub(super) pending: &'a mut Vec<PendingFieldEdit>,
+    pub(super) block_ops: &'a mut Vec<BlockOp>,
+    pub(super) block_confirm: &'a mut Option<BlockConfirm>,
+    /// Set when the user clicks "Open" on a tag-reference row.
+    pub(super) open_request: &'a mut Option<OpenTagRequest>,
+    /// Set when the user clicks "Import" on a geometry tag-reference row.
+    pub(super) tool_import: &'a mut Option<ToolImportRequest>,
+    /// Shader-specific deferred ops (add animated parameter + init).
+    pub(super) shader_ops: &'a mut Vec<ShaderOp>,
+    /// Shader-specific deferred ops (create parameter entry + set real value).
+    pub(super) shader_param_ops: &'a mut Vec<ShaderParamOp>,
+    /// Set when the user clicks a color swatch on a value row; the caller hoists
+    /// it into `self.color_popup` after rendering so the shared popup handler
+    /// can show the picker and apply the edit.
+    pub(super) color_request: &'a mut Option<MaterialColorPopup>,
+    /// The current block clipboard (read), for gating "Paste" in block menus.
+    pub(super) block_clipboard: Option<&'a BlockClipboard>,
+    /// Set when the user clicks "Copy element"; the caller hoists it into
+    /// `self.block_clipboard` after rendering.
+    pub(super) block_clip_request: &'a mut Option<BlockClipboard>,
+    /// Present only on the single frame a "Search fields" query changes. It
+    /// forces every collapsible node's open-state once (matched nodes open /
+    /// rest closed, or restored to defaults when the query is cleared), then
+    /// later frames leave `None` so the user can expand/collapse freely again.
+    pub(super) field_filter: Option<&'a FieldFilterAction>,
+}
+
+impl FieldEditContext<'_> {
+    pub(super) fn widget_id(&self, salt: impl std::hash::Hash) -> egui::Id {
+        egui::Id::new(("field_edit", self.view_scope, self.tag_key, salt))
+    }
+
+    /// Decide the forced open-state for a collapsible node at `node_path`,
+    /// whose normal default is `default_open`. `None` means "leave the node's
+    /// stored state alone" (no filter applied this frame); `Some(open)` forces
+    /// it this frame.
+    pub(super) fn resolve_open(&self, node_path: &str, default_open: bool) -> Option<bool> {
+        match self.field_filter? {
+            // Query cleared: snap every node back to its normal default.
+            FieldFilterAction::RestoreDefaults => Some(default_open),
+            FieldFilterAction::Apply(filter) => {
+                let canon = strip_node_indices(node_path);
+                // The implicit root group has no path — always keep it visible
+                // so the matched nodes inside it can be reached.
+                Some(canon.is_empty() || filter.open_paths.contains(&canon))
+            }
+        }
+    }
+}
+
+/// What a "Search fields" change should do to the editor's collapse state on
+/// the frame it is applied.
+pub(super) enum FieldFilterAction {
+    /// Collapse to the matched nodes (+ ancestors); everything else closed.
+    Apply(FieldFilter),
+    /// Re-expand every node to its normal default (query was cleared).
+    RestoreDefaults,
+}
+
+/// Which collapsible nodes a "Search fields" query wants open. Paths are the
+/// canonical field paths with element indices (`[3]`) stripped, so they're
+/// independent of which block element happens to be selected.
+pub(super) struct FieldFilter {
+    pub(super) open_paths: std::collections::HashSet<String>,
+}
+
+#[derive(Clone)]
+pub(super) struct FieldDisplayMeta {
+    pub(super) label: String,
+    pub(super) unit: Option<String>,
+    pub(super) help: Option<String>,
+    pub(super) read_only: bool,
+    pub(super) advanced: bool,
+}
+
+impl Default for GuiPrefs {
+    fn default() -> Self {
+        Self {
+            browser_mode: BrowserMode::Folders,
+            show_browser_prefixes: false,
+            expert_mode: false,
+            dark_mode: false,
+            blender_path: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum BitmapPanelTab {
+    Fields,
+    Texture,
+}
+
+impl Default for BitmapPanelTab {
+    fn default() -> Self {
+        Self::Fields
+    }
+}
+
+pub(super) struct BitmapPreviewState {
+    pub(super) active_tab: BitmapPanelTab,
+    pub(super) show_red: bool,
+    pub(super) show_green: bool,
+    pub(super) show_blue: bool,
+    pub(super) show_alpha: bool,
+    pub(super) decoded: Option<Result<BitmapPreviewData, String>>,
+    pub(super) texture: Option<egui::TextureHandle>,
+    pub(super) texture_dirty: bool,
+    pub(super) zoom: f32,
+    /// Pan offset of the image center relative to the canvas center, in
+    /// screen pixels. Updated by drag-to-pan and zoom-to-cursor.
+    pub(super) pan: Vec2,
+    /// False until zoom is initialized to fit the image on first decode.
+    pub(super) zoom_initialized: bool,
+}
+
+impl Default for BitmapPreviewState {
+    fn default() -> Self {
+        Self {
+            active_tab: BitmapPanelTab::Fields,
+            show_red: true,
+            show_green: true,
+            show_blue: true,
+            show_alpha: true,
+            decoded: None,
+            texture: None,
+            texture_dirty: true,
+            zoom: 1.0,
+            pan: Vec2::ZERO,
+            zoom_initialized: false,
+        }
+    }
+}
+
+pub(super) struct BitmapPreviewData {
+    pub(super) width: u32,
+    pub(super) height: u32,
+    pub(super) image_count: usize,
+    pub(super) format_name: String,
+    pub(super) type_name: String,
+    pub(super) rgba: Vec<u8>,
+}

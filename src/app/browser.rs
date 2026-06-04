@@ -1,0 +1,626 @@
+use super::*;
+
+pub(super) fn draw_tree(
+    ui: &mut Ui,
+    tree: &TagTree,
+    entries: &[TagEntry],
+    selected: Option<&str>,
+    filter: &str,
+    show_prefixes: bool,
+    groups_mode: bool,
+) -> Option<BrowserAction> {
+    let mut clicked = None;
+    clicked = clicked
+        .or_else(|| draw_entry_list(ui, &tree.entries, entries, selected, filter, show_prefixes));
+    for node in &tree.children {
+        clicked = clicked.or_else(|| {
+            draw_tree_node(
+                ui,
+                node,
+                entries,
+                selected,
+                filter,
+                show_prefixes,
+                groups_mode,
+            )
+        });
+    }
+    clicked
+}
+
+pub(super) fn draw_tree_lazy(
+    ui: &mut Ui,
+    tree: &mut TagTree,
+    entries: &mut Vec<TagEntry>,
+    group_tree: &mut TagTree,
+    root: &Path,
+    names: &TagNameIndex,
+    selected: Option<&str>,
+    filter: &str,
+    show_prefixes: bool,
+    status_update: &mut Option<String>,
+) -> Option<BrowserAction> {
+    let mut clicked = None;
+    clicked = clicked
+        .or_else(|| draw_entry_list(ui, &tree.entries, entries, selected, filter, show_prefixes));
+    for node in &mut tree.children {
+        clicked = clicked.or_else(|| {
+            draw_tree_node_lazy(
+                ui,
+                node,
+                entries,
+                group_tree,
+                root,
+                names,
+                selected,
+                filter,
+                show_prefixes,
+                status_update,
+            )
+        });
+    }
+    clicked
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_tree_node_lazy(
+    ui: &mut Ui,
+    node: &mut TagTreeNode,
+    entries: &mut Vec<TagEntry>,
+    group_tree: &mut TagTree,
+    root: &Path,
+    names: &TagNameIndex,
+    selected: Option<&str>,
+    filter: &str,
+    show_prefixes: bool,
+    status_update: &mut Option<String>,
+) -> Option<BrowserAction> {
+    if !filter.is_empty() && !lazy_node_matches(node, entries, filter) {
+        return None;
+    }
+    let mut clicked = None;
+    let folder_label = if show_prefixes {
+        format!("[folder] {}", node.label)
+    } else {
+        node.label.clone()
+    };
+    let response = egui::CollapsingHeader::new(RichText::new(folder_label).color(text_dark()))
+        .icon(folder_arrow_icon)
+        .default_open(!filter.is_empty())
+        .show(ui, |ui| {
+            if !node.entries_loaded {
+                match load_folder_node_entries(root, node, entries, names) {
+                    Ok(()) => {
+                        *group_tree = crate::source::build_group_tree(entries);
+                        *status_update = Some(format!(
+                            "Loaded {} tag(s) from {}",
+                            node.entries.len(),
+                            node.label
+                        ));
+                    }
+                    Err(error) => {
+                        *status_update = Some(format!(
+                            "Failed to load folder {}: {error}",
+                            node.rel_path.display()
+                        ));
+                    }
+                }
+            }
+            if clicked.is_none() {
+                clicked =
+                    draw_entry_list(ui, &node.entries, entries, selected, filter, show_prefixes);
+            } else {
+                let _ =
+                    draw_entry_list(ui, &node.entries, entries, selected, filter, show_prefixes);
+            }
+            for child in &mut node.children {
+                if clicked.is_none() {
+                    clicked = draw_tree_node_lazy(
+                        ui,
+                        child,
+                        entries,
+                        group_tree,
+                        root,
+                        names,
+                        selected,
+                        filter,
+                        show_prefixes,
+                        status_update,
+                    );
+                }
+            }
+        });
+    response.header_response.context_menu(|ui| {
+        if ui.button("Dump folder to JSON...").clicked() {
+            clicked = Some(BrowserAction::DumpLooseFolderJson {
+                rel_path: node.rel_path.clone(),
+                label: node.label.clone(),
+            });
+            ui.close_menu();
+        }
+        let bitmap_keys = collect_bitmap_keys(node, entries);
+        if bitmap_keys.is_empty() {
+            ui.label(RichText::new("No loaded bitmap tags in this folder").color(subtle_dark()));
+        } else if ui
+            .button(format!("Extract loaded bitmaps... ({})", bitmap_keys.len()))
+            .clicked()
+        {
+            clicked = Some(BrowserAction::ExtractBitmapFolder(bitmap_keys));
+            ui.close_menu();
+        }
+    });
+    clicked
+}
+
+pub(super) fn draw_tree_node(
+    ui: &mut Ui,
+    node: &TagTreeNode,
+    entries: &[TagEntry],
+    selected: Option<&str>,
+    filter: &str,
+    show_prefixes: bool,
+    groups_mode: bool,
+) -> Option<BrowserAction> {
+    if !filter.is_empty() && !node_matches(node, entries, filter) {
+        return None;
+    }
+    let mut clicked = None;
+    let folder_label = if groups_mode {
+        group_folder_label(&node.label, show_prefixes)
+    } else if show_prefixes {
+        format!("[folder] {}", node.label)
+    } else {
+        node.label.clone()
+    };
+    let response = egui::CollapsingHeader::new(RichText::new(folder_label).color(text_dark()))
+        .icon(folder_arrow_icon)
+        .default_open(!filter.is_empty())
+        .show(ui, |ui| {
+            if clicked.is_none() {
+                clicked =
+                    draw_entry_list(ui, &node.entries, entries, selected, filter, show_prefixes);
+            } else {
+                let _ =
+                    draw_entry_list(ui, &node.entries, entries, selected, filter, show_prefixes);
+            }
+            for child in &node.children {
+                if clicked.is_none() {
+                    clicked = draw_tree_node(
+                        ui,
+                        child,
+                        entries,
+                        selected,
+                        filter,
+                        show_prefixes,
+                        groups_mode,
+                    );
+                }
+            }
+        });
+    response.header_response.context_menu(|ui| {
+        let tag_keys = collect_tag_keys(node, entries);
+        if tag_keys.is_empty() {
+            ui.label(RichText::new("No tags in this folder").color(subtle_dark()));
+        } else if ui
+            .button(format!("Dump folder to JSON... ({})", tag_keys.len()))
+            .clicked()
+        {
+            clicked = Some(BrowserAction::DumpLoadedFolderJson(tag_keys));
+            ui.close_menu();
+        }
+
+        let bitmap_keys = collect_bitmap_keys(node, entries);
+        if bitmap_keys.is_empty() {
+            ui.label(RichText::new("No bitmap tags in this folder").color(subtle_dark()));
+        } else if ui
+            .button(format!("Extract all bitmaps... ({})", bitmap_keys.len()))
+            .clicked()
+        {
+            clicked = Some(BrowserAction::ExtractBitmapFolder(bitmap_keys));
+            ui.close_menu();
+        }
+    });
+    clicked
+}
+
+pub(super) fn collect_tag_keys(node: &TagTreeNode, entries: &[TagEntry]) -> Vec<String> {
+    let mut keys = Vec::new();
+    collect_tag_keys_into(node, entries, &mut keys);
+    keys
+}
+
+pub(super) fn collect_tag_keys_into(
+    node: &TagTreeNode,
+    entries: &[TagEntry],
+    keys: &mut Vec<String>,
+) {
+    for &entry_index in &node.entries {
+        if let Some(entry) = entries.get(entry_index) {
+            keys.push(entry.key.clone());
+        }
+    }
+    for child in &node.children {
+        collect_tag_keys_into(child, entries, keys);
+    }
+}
+
+pub(super) fn collect_bitmap_keys(node: &TagTreeNode, entries: &[TagEntry]) -> Vec<String> {
+    let mut keys = Vec::new();
+    collect_bitmap_keys_into(node, entries, &mut keys);
+    keys
+}
+
+pub(super) fn collect_bitmap_keys_into(
+    node: &TagTreeNode,
+    entries: &[TagEntry],
+    keys: &mut Vec<String>,
+) {
+    for &entry_index in &node.entries {
+        if let Some(entry) = entries.get(entry_index) {
+            if is_bitmap_tag(entry) {
+                keys.push(entry.key.clone());
+            }
+        }
+    }
+    for child in &node.children {
+        collect_bitmap_keys_into(child, entries, keys);
+    }
+}
+
+pub(super) fn draw_entry_list(
+    ui: &mut Ui,
+    entry_indices: &[usize],
+    entries: &[TagEntry],
+    selected: Option<&str>,
+    filter: &str,
+    show_prefixes: bool,
+) -> Option<BrowserAction> {
+    if filter.is_empty() && entry_indices.len() > MAX_BROWSER_ENTRIES_PER_NODE {
+        return draw_capped_entry_list(ui, entry_indices, entries, selected, show_prefixes);
+    }
+
+    let mut clicked = None;
+    for &entry_index in entry_indices {
+        let entry = &entries[entry_index];
+        if !entry_matches(entry, filter) {
+            continue;
+        }
+        if clicked.is_none() {
+            clicked = draw_entry(ui, entry, selected, show_prefixes);
+        } else {
+            let _ = draw_entry(ui, entry, selected, show_prefixes);
+        }
+    }
+    clicked
+}
+
+pub(super) fn draw_capped_entry_list(
+    ui: &mut Ui,
+    entry_indices: &[usize],
+    entries: &[TagEntry],
+    selected: Option<&str>,
+    show_prefixes: bool,
+) -> Option<BrowserAction> {
+    let mut clicked = None;
+    let selected_index = selected.and_then(|selected| {
+        entry_indices
+            .iter()
+            .position(|&entry_index| entries[entry_index].key == selected)
+    });
+
+    for &entry_index in entry_indices.iter().take(MAX_BROWSER_ENTRIES_PER_NODE) {
+        let entry = &entries[entry_index];
+        if clicked.is_none() {
+            clicked = draw_entry(ui, entry, selected, show_prefixes);
+        } else {
+            let _ = draw_entry(ui, entry, selected, show_prefixes);
+        }
+    }
+
+    if let Some(position) = selected_index {
+        if position >= MAX_BROWSER_ENTRIES_PER_NODE {
+            ui.label(RichText::new("...").color(subtle_dark()));
+            let entry = &entries[entry_indices[position]];
+            if clicked.is_none() {
+                clicked = draw_entry(ui, entry, selected, show_prefixes);
+            } else {
+                let _ = draw_entry(ui, entry, selected, show_prefixes);
+            }
+        }
+    }
+
+    let shown = MAX_BROWSER_ENTRIES_PER_NODE.min(entry_indices.len())
+        + usize::from(
+            selected_index.is_some_and(|position| position >= MAX_BROWSER_ENTRIES_PER_NODE),
+        );
+    let hidden = entry_indices.len().saturating_sub(shown);
+    if hidden > 0 {
+        ui.label(
+            RichText::new(format!(
+                "... {hidden} more tags hidden here; use search to narrow"
+            ))
+            .color(subtle_dark()),
+        );
+    }
+    clicked
+}
+
+pub(super) fn draw_entry(
+    ui: &mut Ui,
+    entry: &TagEntry,
+    selected: Option<&str>,
+    show_prefixes: bool,
+) -> Option<BrowserAction> {
+    let label = entry
+        .display_path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&entry.display_path);
+    let label = if show_prefixes {
+        format!("[tag] {label}")
+    } else {
+        label.to_owned()
+    };
+    let response = ui
+        .selectable_label(
+            selected == Some(entry.key.as_str()),
+            RichText::new(label).color(text_dark()),
+        )
+        .on_hover_text(&entry.display_path);
+    let mut action = response
+        .clicked()
+        .then(|| BrowserAction::Select(entry.key.clone()));
+    response.context_menu(|ui| {
+        if ui.button("Open with File Explorer").clicked() {
+            action = Some(BrowserAction::OpenInExplorer(entry.key.clone()));
+            ui.close_menu();
+        }
+        ui.separator();
+        if ui.button("Dump tag to JSON...").clicked() {
+            action = Some(BrowserAction::DumpJson(entry.key.clone()));
+            ui.close_menu();
+        }
+        if is_monolithic_entry(entry) && ui.button("Extract raw tag...").clicked() {
+            action = Some(BrowserAction::ExtractRaw(entry.key.clone()));
+            ui.close_menu();
+        }
+        if is_bitmap_group(entry.group_tag) && ui.button("Extract bitmap images...").clicked() {
+            action = Some(BrowserAction::ExtractBitmap(entry.key.clone()));
+            ui.close_menu();
+        }
+        if supports_geometry_extraction(entry.group_tag)
+            && ui.button(geometry_extract_label(entry.group_tag)).clicked()
+        {
+            action = Some(BrowserAction::ExtractGeometry(entry.key.clone()));
+            ui.close_menu();
+        }
+        if supports_import_info_extraction(entry.group_tag)
+            && ui.button("Extract import info...").clicked()
+        {
+            action = Some(BrowserAction::ExtractImportInfo(entry.key.clone()));
+            ui.close_menu();
+        }
+        if supports_animation_extraction(entry.group_tag)
+            && ui.button("Extract animations...").clicked()
+        {
+            action = Some(BrowserAction::ExtractAnimation(entry.key.clone()));
+            ui.close_menu();
+        }
+    });
+    action
+}
+
+pub(super) fn is_monolithic_entry(entry: &TagEntry) -> bool {
+    matches!(entry.location, TagEntryLocation::Monolithic { .. })
+}
+
+pub(super) fn folder_arrow_icon(ui: &mut Ui, openness: f32, response: &egui::Response) {
+    let center = response.rect.center();
+    let size = 7.0;
+    let color = if openness > 0.5 {
+        Color32::from_rgb(28, 143, 66)
+    } else {
+        Color32::from_rgb(24, 111, 205)
+    };
+    let points = if openness > 0.5 {
+        vec![
+            egui::pos2(center.x - size, center.y - size * 0.4),
+            egui::pos2(center.x + size, center.y - size * 0.4),
+            egui::pos2(center.x, center.y + size * 0.7),
+        ]
+    } else {
+        vec![
+            egui::pos2(center.x - size * 0.4, center.y - size),
+            egui::pos2(center.x - size * 0.4, center.y + size),
+            egui::pos2(center.x + size * 0.7, center.y),
+        ]
+    };
+    ui.painter()
+        .add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
+}
+
+pub(super) fn tag_tab_label(entry: &TagEntry) -> String {
+    entry
+        .display_path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&entry.display_path)
+        .to_owned()
+}
+
+pub(super) fn tag_file_name(entry: &TagEntry) -> String {
+    entry
+        .display_path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("tag")
+        .to_owned()
+}
+
+pub(super) fn tag_file_stem(entry: &TagEntry) -> String {
+    Path::new(&tag_file_name(entry))
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("tag")
+        .to_owned()
+}
+
+pub(super) fn tag_display_parent(entry: &TagEntry) -> PathBuf {
+    Path::new(&entry.display_path)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+}
+
+pub(super) fn tag_json_relative_path(entry: &TagEntry) -> PathBuf {
+    let mut path = PathBuf::from(&entry.display_path);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("tag");
+    path.set_file_name(format!("{file_name}.json"));
+    path
+}
+
+pub(super) fn is_bitmap_group(group_tag: u32) -> bool {
+    group_tag == u32::from_be_bytes(*b"bitm")
+}
+
+pub(super) fn is_bitmap_tag(entry: &TagEntry) -> bool {
+    is_bitmap_group(entry.group_tag)
+        || entry.group_name.as_deref() == Some("bitmap")
+        || entry.display_path.to_ascii_lowercase().ends_with(".bitmap")
+}
+
+pub(super) fn supports_geometry_extraction(group_tag: u32) -> bool {
+    matches!(
+        group_tag.to_be_bytes().as_slice(),
+        b"hlmt" | b"scnr" | b"sbsp" | b"mode" | b"coll" | b"phmo"
+    )
+}
+
+pub(super) fn supports_import_info_extraction(group_tag: u32) -> bool {
+    matches!(
+        group_tag.to_be_bytes().as_slice(),
+        b"mode" | b"coll" | b"phmo" | b"sbsp"
+    )
+}
+
+pub(super) fn geometry_extract_label(group_tag: u32) -> &'static str {
+    match &group_tag.to_be_bytes() {
+        b"hlmt" => "Extract model geometry...",
+        b"scnr" => "Extract scenario BSP geometry...",
+        b"sbsp" => "Extract BSP geometry...",
+        b"mode" => "Extract render_model geometry...",
+        b"coll" => "Extract collision_model geometry...",
+        b"phmo" => "Extract physics_model geometry...",
+        _ => "Extract geometry...",
+    }
+}
+
+pub(super) fn supports_animation_extraction(group_tag: u32) -> bool {
+    matches!(group_tag.to_be_bytes().as_slice(), b"jmad" | b"hlmt")
+}
+
+pub(super) fn node_matches(node: &TagTreeNode, entries: &[TagEntry], filter: &str) -> bool {
+    node.entries
+        .iter()
+        .any(|&index| entry_matches(&entries[index], filter))
+        || node
+            .children
+            .iter()
+            .any(|child| node_matches(child, entries, filter))
+}
+
+pub(super) fn lazy_node_matches(node: &TagTreeNode, entries: &[TagEntry], filter: &str) -> bool {
+    // Only show a folder node if it contains files whose NAME matches —
+    // don't keep a folder open just because its own path contains the term.
+    node.entries
+        .iter()
+        .any(|&index| entry_matches(&entries[index], filter))
+        || node
+            .children
+            .iter()
+            .any(|child| lazy_node_matches(child, entries, filter))
+}
+
+pub(super) fn entry_matches(entry: &TagEntry, filter: &str) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    entry_matches_lower(entry, &filter.to_ascii_lowercase())
+}
+
+/// Like [`entry_matches`] but takes an already-lowercased filter, so callers
+/// that test many entries against one query don't re-lowercase it each time.
+fn entry_matches_lower(entry: &TagEntry, filter_lower: &str) -> bool {
+    // Match only the filename (last path segment), not parent folder names.
+    // A tag at "floodcombat_elite/garbage/hg_arm/hg_arm.model" should NOT
+    // appear when searching "elite" — only "elite.model" etc. should match.
+    let filename = entry
+        .display_path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&entry.display_path);
+    filename.to_ascii_lowercase().contains(filter_lower)
+        || format_group_tag(entry.group_tag)
+            .to_ascii_lowercase()
+            .contains(filter_lower)
+        || entry
+            .group_name
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .contains(filter_lower)
+}
+
+/// Collect the indices of all entries matching `filter`, in display order.
+/// Called only when the cached query changes (see [`FilterCache`]), not per
+/// frame, so the O(N) lowercase scan happens at most once per keystroke.
+pub(super) fn compute_filter_matches(entries: &[TagEntry], filter: &str) -> Vec<usize> {
+    let filter_lower = filter.to_ascii_lowercase();
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry_matches_lower(entry, &filter_lower))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::source::{TagEntry, TagEntryLocation};
+    use std::path::PathBuf;
+
+    fn entry(display_path: &str, group: &[u8; 4]) -> TagEntry {
+        TagEntry {
+            key: display_path.to_owned(),
+            display_path: display_path.to_owned(),
+            group_tag: u32::from_be_bytes(*group),
+            group_name: None,
+            location: TagEntryLocation::LooseFile(PathBuf::from(display_path)),
+        }
+    }
+
+    #[test]
+    fn matches_filename_not_parent_folders() {
+        let entries = vec![
+            entry("floodcombat_elite/garbage/hg_arm/hg_arm.model", b"mode"),
+            entry("characters/elite/elite.model", b"mode"),
+        ];
+        // "elite" should match only the tag whose *filename* contains it.
+        let matches = compute_filter_matches(&entries, "elite");
+        assert_eq!(matches, vec![1]);
+    }
+
+    #[test]
+    fn matches_group_tag_and_is_case_insensitive() {
+        let entries = vec![
+            entry("fx/spark.effect", b"effe"),
+            entry("weapons/rifle.weapon", b"weap"),
+        ];
+        // Group four-CC match, regardless of query case.
+        assert_eq!(compute_filter_matches(&entries, "WEAP"), vec![1]);
+    }
+}
