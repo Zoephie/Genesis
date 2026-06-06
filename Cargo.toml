@@ -7,7 +7,7 @@ default-members = [".", "blam-tags/blam-tag-shell"]
 
 [package]
 name = "genesis"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 build = "build.rs"
 default-run = "Genesis"
