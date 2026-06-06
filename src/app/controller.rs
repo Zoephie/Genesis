@@ -11,6 +11,14 @@ impl Genesis {
                 WorkerMessage::TerminalDone => {
                     self.terminal.running = false;
                     self.terminal.scroll_to_bottom = true;
+                    self.terminal.refocus_input = true;
+                }
+                WorkerMessage::UpdateCheckFinished(result) => {
+                    self.status = match result {
+                        Ok(result) => update_check_status(&result),
+                        Err(error) if error == NO_PUBLIC_RELEASE_MESSAGE => error,
+                        Err(error) => format!("Update check failed: {error}"),
+                    };
                 }
                 WorkerMessage::SourceLoaded(Ok(mut loaded)) => {
                     // Set terminal work dir to the game kit root (parent of tags/).
@@ -73,6 +81,26 @@ impl Genesis {
                         }
                         Err(error) => {
                             self.status = error;
+                        }
+                    }
+                }
+                WorkerMessage::BitmapReimportFinished { key, result } => {
+                    self.terminal.running = false;
+                    self.terminal.scroll_to_bottom = true;
+                    self.terminal.refocus_input = true;
+                    match result {
+                        Ok(tag) => {
+                            if self.open_tabs.iter().any(|tab| tab == &key) {
+                                self.parsed_tags
+                                    .insert(key.clone(), TagDocument::clean(tag));
+                                self.bitmap_previews.remove(&key);
+                                self.remember_tag_use(&key);
+                                self.trim_tag_memory();
+                            }
+                            self.status = "Bitmap reimported and reloaded".to_owned();
+                        }
+                        Err(error) => {
+                            self.status = format!("Bitmap reimport failed: {error}");
                         }
                     }
                 }
@@ -206,13 +234,53 @@ impl Genesis {
         });
     }
 
+    pub(super) fn begin_check_for_updates(&mut self, ctx: egui::Context) {
+        self.status = "Checking for updates...".to_owned();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = fetch_latest_release();
+            let _ = tx.send(WorkerMessage::UpdateCheckFinished(result));
+            ctx.request_repaint();
+        });
+    }
+
     pub(super) fn begin_terminal_command(&mut self, ctx: egui::Context) {
         let command = self.terminal.input.trim().to_owned();
         if command.is_empty() {
             return;
         }
+        if self.terminal.history.last() != Some(&command) {
+            self.terminal.history.push(command.clone());
+        }
+        self.terminal.history_cursor = None;
         self.terminal.input.clear();
+        self.terminal.refocus_input = true;
         self.spawn_terminal_command(command, ctx);
+    }
+
+    pub(super) fn recall_terminal_history(&mut self, delta: i32) {
+        let len = self.terminal.history.len();
+        if len == 0 {
+            return;
+        }
+
+        let next = match self.terminal.history_cursor {
+            Some(index) => index as i32 + delta,
+            None if delta < 0 => len as i32 - 1,
+            None => return,
+        };
+
+        if next < 0 {
+            self.terminal.history_cursor = Some(0);
+            self.terminal.input = self.terminal.history[0].clone();
+        } else if next >= len as i32 {
+            self.terminal.history_cursor = None;
+            self.terminal.input.clear();
+        } else {
+            let next = next as usize;
+            self.terminal.history_cursor = Some(next);
+            self.terminal.input = self.terminal.history[next].clone();
+        }
     }
 
     /// Run `command` in the editing-kit root, streaming output to the terminal
@@ -229,6 +297,7 @@ impl Genesis {
         self.terminal_open = true;
         self.terminal.lines.push(format!("> {command}"));
         self.terminal.scroll_to_bottom = true;
+        self.terminal.refocus_input = true;
         self.terminal.running = true;
         let tx = self.tx.clone();
         thread::spawn(move || {
@@ -336,21 +405,23 @@ impl Genesis {
     }
 
     pub(super) fn close_tab(&mut self, key: &str) {
+        let removed_index = self.open_tabs.iter().position(|tab| tab == key);
         self.open_tabs.retain(|tab| tab != key);
         self.floating_tabs.remove(key);
         self.unload_tag(key);
         if self.selected_key.as_deref() == Some(key) {
-            self.selected_key = self.open_tabs.last().cloned();
+            self.selected_key = selected_tab_after_removal(&self.open_tabs, removed_index);
         }
         self.color_popup = None;
         self.function_popup = None;
     }
 
     pub(super) fn pop_tab(&mut self, key: &str) {
+        let removed_index = self.open_tabs.iter().position(|tab| tab == key);
         self.open_tabs.retain(|tab| tab != key);
         self.floating_tabs.insert(key.to_owned());
         if self.selected_key.as_deref() == Some(key) {
-            self.selected_key = self.open_tabs.last().cloned();
+            self.selected_key = selected_tab_after_removal(&self.open_tabs, removed_index);
         }
         self.color_popup = None;
         self.function_popup = None;
@@ -763,7 +834,7 @@ impl Genesis {
             self.status = "Monolithic cache tags are read-only".to_owned();
             return;
         };
-        match doc.tag.write(path) {
+        match doc.tag.write_atomic(path) {
             Ok(()) => {
                 if let Some(doc) = self.parsed_tags.get_mut(&key) {
                     doc.dirty = false;
@@ -774,10 +845,56 @@ impl Genesis {
         }
     }
 
+    pub(super) fn save_current_tag_as(&mut self) {
+        let Some(key) = self.selected_key.clone() else {
+            self.status = "No tag selected".to_owned();
+            return;
+        };
+        let Some(entry) = self.entry_for_key(&key).cloned() else {
+            self.status = "Selected tag is no longer in the source".to_owned();
+            return;
+        };
+        let Some(doc) = self.parsed_tags.get(&key) else {
+            self.status = "Load the selected tag before saving".to_owned();
+            return;
+        };
+        if doc.tag.endian != Endian::Le {
+            self.status = "Only little-endian tags can be saved".to_owned();
+            return;
+        }
+
+        let extension = save_as_extension(self, &entry);
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Save Current Tag As")
+            .set_file_name(save_as_file_name(&entry, extension.as_deref()));
+        if let Some(parent) = save_as_start_dir(&entry) {
+            dialog = dialog.set_directory(parent);
+        }
+        if let Some(extension) = extension.as_deref() {
+            dialog = dialog.add_filter("Tag file", &[extension]);
+        }
+        let Some(mut output) = dialog.save_file() else {
+            return;
+        };
+        if output.extension().is_none() {
+            if let Some(extension) = extension.as_deref() {
+                output.set_extension(extension);
+            }
+        }
+
+        match doc.tag.write_atomic(&output) {
+            Ok(()) => {
+                self.status = format!("Saved copy to {}", output.display());
+            }
+            Err(error) => self.status = format!("Save As failed: {error}"),
+        }
+    }
+
     pub(super) fn current_prefs(&self) -> GuiPrefs {
         GuiPrefs {
             browser_mode: self.browser_mode,
             show_browser_prefixes: self.show_browser_prefixes,
+            double_click_to_open_tags: self.double_click_to_open_tags,
             expert_mode: self.expert_mode,
             dark_mode: self.dark_mode,
             blender_path: self.blender_path.clone(),
@@ -968,6 +1085,51 @@ impl Genesis {
         self.spawn_terminal_command(command, ctx.clone());
     }
 
+    pub(super) fn begin_reimport_bitmap(&mut self, key: String, ctx: egui::Context) {
+        if self.terminal.running {
+            self.status = "A command is already running".to_owned();
+            return;
+        }
+        let Some(source) = self.source.as_ref().map(|source| source.source.clone()) else {
+            self.status = "Reimport requires a loaded editing-kit folder".to_owned();
+            return;
+        };
+        let Some(entry) = self.entry_for_key(&key).cloned() else {
+            self.status = "Bitmap tag is no longer in the source".to_owned();
+            return;
+        };
+        let Some(tags_root) = (match &source {
+            TagSource::LooseFolder { root } => Some(root.as_path()),
+            _ => None,
+        }) else {
+            self.status = "Bitmap reimport requires a loose tags folder".to_owned();
+            return;
+        };
+        let Some(work_dir) = tags_root.parent().map(Path::to_path_buf) else {
+            self.status = "Could not resolve editing-kit root".to_owned();
+            return;
+        };
+        let Some(data_path) = bitmap_reimport_data_path(&entry, Some(tags_root)) else {
+            self.status = "Could not resolve bitmap data path".to_owned();
+            return;
+        };
+        let command = format!("tool bitmaps \"{data_path}\"");
+        self.terminal_open = true;
+        self.terminal.lines.push(format!("> {command}"));
+        self.terminal.scroll_to_bottom = true;
+        self.terminal.refocus_input = true;
+        self.terminal.running = true;
+        self.status = format!("Reimporting bitmap {}", entry.display_path);
+
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = run_terminal_command_for_reimport(&command, &work_dir, &tx, &ctx)
+                .and_then(|_| read_entry(&source, &entry).map_err(|error| error.to_string()));
+            let _ = tx.send(WorkerMessage::BitmapReimportFinished { key, result });
+            ctx.request_repaint();
+        });
+    }
+
     /// Render the block delete/delete-all confirmation modal (if pending) and
     /// apply the op on confirm.
     pub(super) fn handle_block_confirm(&mut self, ctx: &egui::Context) {
@@ -1052,6 +1214,7 @@ impl Genesis {
             let mut open = true;
             let mut dock_requested = false;
             let mut edit_status = None;
+            let mut bitmap_reimport_request = None;
             let window_response = egui::Window::new(tag_tab_label(&entry))
                 .id(egui::Id::new(("floating_tag", key.clone())))
                 .resizable(true)
@@ -1088,6 +1251,7 @@ impl Genesis {
                     let mut block_ops = Vec::new();
                     let mut shader_ops = Vec::new();
                     let mut shader_param_ops = Vec::new();
+                    let mut bitmap_reimport = None;
                     let field_filter = compute_pending_field_filter(
                         &doc.tag,
                         supports_field_search,
@@ -1115,6 +1279,7 @@ impl Genesis {
                         block_confirm: &mut self.block_confirm,
                         open_request: &mut self.pending_open,
                         tool_import: &mut self.pending_tool_import,
+                        bitmap_reimport: &mut bitmap_reimport,
                         shader_ops: &mut shader_ops,
                         shader_param_ops: &mut shader_param_ops,
                         color_request: &mut color_request,
@@ -1122,19 +1287,34 @@ impl Genesis {
                         block_clip_request: &mut block_clip_request,
                         field_filter: field_filter.as_ref(),
                     };
-                    draw_tag(
-                        ui,
-                        &doc.tag,
-                        &entry,
-                        &self.names,
-                        self.source.as_ref().map(|source| &source.source),
-                        &mut self.rmdf_cache,
-                        &mut self.rmop_cache,
-                        &mut self.color_popup,
-                        &mut self.function_popup,
-                        self.expert_mode,
-                        &mut edit_context,
-                    );
+                    if is_bitmap_tag(&entry) {
+                        let preview = self.bitmap_previews.entry(key.clone()).or_default();
+                        draw_bitmap_tag(
+                            ui,
+                            ctx,
+                            &doc.tag,
+                            &entry,
+                            &self.names,
+                            &mut self.color_popup,
+                            preview,
+                            self.expert_mode,
+                            &mut edit_context,
+                        );
+                    } else {
+                        draw_tag(
+                            ui,
+                            &doc.tag,
+                            &entry,
+                            &self.names,
+                            self.source.as_ref().map(|source| &source.source),
+                            &mut self.rmdf_cache,
+                            &mut self.rmop_cache,
+                            &mut self.color_popup,
+                            &mut self.function_popup,
+                            self.expert_mode,
+                            &mut edit_context,
+                        );
+                    }
                     edit_status = apply_pending_edits(&mut doc.tag, pending, &mut doc.dirty);
                     if let Some(status) = apply_block_ops(&mut doc.tag, block_ops, &mut doc.dirty) {
                         edit_status = Some(status);
@@ -1161,6 +1341,7 @@ impl Genesis {
                         ));
                         self.block_clipboard = Some(clip);
                     }
+                    bitmap_reimport_request = bitmap_reimport;
                 });
             if let Some(inner) = &window_response {
                 let pointer_down_over_window = ctx.input(|input| {
@@ -1188,9 +1369,325 @@ impl Genesis {
             if let Some(status) = edit_status {
                 self.status = status;
             }
+            if let Some(key) = bitmap_reimport_request {
+                self.begin_reimport_bitmap(key, ctx.clone());
+            }
         }
         for key in closed {
             self.floating_tabs.remove(&key);
         }
+    }
+}
+
+fn save_as_extension(app: &Genesis, entry: &TagEntry) -> Option<String> {
+    app.names
+        .name_for(entry.group_tag)
+        .or_else(|| group_tag_to_extension(entry.group_tag))
+        .map(|extension| extension.trim().to_owned())
+        .filter(|extension| !extension.is_empty())
+}
+
+fn save_as_file_name(entry: &TagEntry, extension: Option<&str>) -> String {
+    let path = match &entry.location {
+        TagEntryLocation::LooseFile(path) => path,
+        TagEntryLocation::Monolithic { .. } => Path::new(&entry.display_path),
+    };
+    let mut file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .or_else(|| {
+            Path::new(&entry.display_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| clean_file_name(&entry.display_path));
+    if Path::new(&file_name).extension().is_none() {
+        if let Some(extension) = extension {
+            file_name.push('.');
+            file_name.push_str(extension);
+        }
+    }
+    file_name
+}
+
+fn save_as_start_dir(entry: &TagEntry) -> Option<PathBuf> {
+    match &entry.location {
+        TagEntryLocation::LooseFile(path) => path.parent().map(Path::to_path_buf),
+        TagEntryLocation::Monolithic { .. } => None,
+    }
+}
+
+fn clean_file_name(value: &str) -> String {
+    let mut name = value
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("tag")
+        .trim()
+        .to_owned();
+    name.retain(|ch| !matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'));
+    if name.is_empty() {
+        "tag".to_owned()
+    } else {
+        name
+    }
+}
+
+fn run_terminal_command_for_reimport(
+    command: &str,
+    work_dir: &Path,
+    tx: &Sender<WorkerMessage>,
+    ctx: &egui::Context,
+) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut c = std::process::Command::new("cmd");
+        c.creation_flags(CREATE_NO_WINDOW);
+        c.args(["/C", &format!("{command} 2>&1")]);
+        c
+    };
+    #[cfg(not(target_os = "windows"))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", command]);
+        c
+    };
+    cmd.current_dir(work_dir)
+        .stdout(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null());
+    let mut child = cmd.spawn().map_err(|error| {
+        let message = format!("[error] {error}");
+        let _ = tx.send(WorkerMessage::TerminalLine(message.clone()));
+        ctx.request_repaint();
+        message
+    })?;
+    use std::io::BufRead;
+    if let Some(stdout) = child.stdout.take() {
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines() {
+            match line {
+                Ok(line) => {
+                    let _ = tx.send(WorkerMessage::TerminalLine(line));
+                    ctx.request_repaint();
+                }
+                Err(error) => {
+                    let message = format!("Could not read tool output: {error}");
+                    let _ = tx.send(WorkerMessage::TerminalLine(format!("[error] {message}")));
+                    return Err(message);
+                }
+            }
+        }
+    }
+    let status = child
+        .wait()
+        .map_err(|error| format!("Could not wait for tool: {error}"))?;
+    if let Some(code) = status.code() {
+        let _ = tx.send(WorkerMessage::TerminalLine(format!("[exit {code}]")));
+    }
+    if status.success() {
+        Ok(())
+    } else {
+        Err(status
+            .code()
+            .map(|code| format!("tool exited with code {code}"))
+            .unwrap_or_else(|| "tool exited without a status code".to_owned()))
+    }
+}
+
+fn fetch_latest_release() -> Result<UpdateCheckResult, String> {
+    #[cfg(target_os = "windows")]
+    {
+        fetch_latest_release_powershell()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        fetch_latest_release_curl()
+    }
+}
+
+const NO_PUBLIC_RELEASE_MESSAGE: &str = "No public Genesis releases found yet";
+
+#[cfg(target_os = "windows")]
+fn fetch_latest_release_powershell() -> Result<UpdateCheckResult, String> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $headers = @{{ 'User-Agent' = 'Genesis' }}; \
+         try {{ \
+             $release = Invoke-RestMethod -UseBasicParsing -Headers $headers -Uri '{}'; \
+             [Console]::Out.WriteLine($release.tag_name); \
+             [Console]::Out.WriteLine($release.html_url); \
+         }} catch {{ \
+             $statusCode = $null; \
+             if ($_.Exception.Response -ne $null) {{ \
+                 $statusCode = [int]$_.Exception.Response.StatusCode; \
+             }} \
+             if ($statusCode -eq 404) {{ \
+                 [Console]::Out.WriteLine('__GENESIS_NO_PUBLIC_RELEASE__'); \
+                 exit 0; \
+             }} \
+             [Console]::Error.WriteLine($_.Exception.Message); \
+             exit 1; \
+         }}",
+        GENESIS_LATEST_RELEASE_API
+    );
+    let output = Command::new("powershell.exe")
+        .creation_flags(CREATE_NO_WINDOW)
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ])
+        .output()
+        .map_err(|error| format!("Could not run PowerShell: {error}"))?;
+    parse_latest_release_lines(&output.stdout, &output.stderr, output.status.success())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn fetch_latest_release_curl() -> Result<UpdateCheckResult, String> {
+    let output = Command::new("curl")
+        .args([
+            "-sSL",
+            "-w",
+            "\n%{http_code}",
+            "-H",
+            "User-Agent: Genesis",
+            GENESIS_LATEST_RELEASE_API,
+        ])
+        .output()
+        .map_err(|error| format!("Could not run curl: {error}"))?;
+    if !output.status.success() {
+        return Err(command_error(&output.stderr));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let Some((body, status_code)) = text.rsplit_once('\n') else {
+        return Err("GitHub response did not include an HTTP status".to_owned());
+    };
+    if status_code.trim() == "404" {
+        return Err(NO_PUBLIC_RELEASE_MESSAGE.to_owned());
+    }
+    if status_code.trim() != "200" {
+        return Err(format!("GitHub returned HTTP {}", status_code.trim()));
+    }
+    let value: Value = serde_json::from_str(body)
+        .map_err(|error| format!("GitHub returned invalid JSON: {error}"))?;
+    let latest_tag = value
+        .get("tag_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    if latest_tag.is_empty() {
+        return Err("GitHub response did not include a release tag".to_owned());
+    }
+    let release_url = value
+        .get("html_url")
+        .and_then(Value::as_str)
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or(GENESIS_RELEASES_URL)
+        .to_owned();
+    Ok(UpdateCheckResult {
+        latest_tag,
+        release_url,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn parse_latest_release_lines(
+    stdout: &[u8],
+    stderr: &[u8],
+    success: bool,
+) -> Result<UpdateCheckResult, String> {
+    if !success {
+        return Err(command_error(stderr));
+    }
+    let text = String::from_utf8_lossy(stdout);
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let latest_tag = lines.next().unwrap_or_default().to_owned();
+    if latest_tag == "__GENESIS_NO_PUBLIC_RELEASE__" {
+        return Err(NO_PUBLIC_RELEASE_MESSAGE.to_owned());
+    }
+    if latest_tag.is_empty() {
+        return Err("GitHub response did not include a release tag".to_owned());
+    }
+    let release_url = lines
+        .next()
+        .filter(|url| !url.is_empty())
+        .unwrap_or(GENESIS_RELEASES_URL)
+        .to_owned();
+    Ok(UpdateCheckResult {
+        latest_tag,
+        release_url,
+    })
+}
+
+fn command_error(stderr: &[u8]) -> String {
+    let message = String::from_utf8_lossy(stderr).trim().to_owned();
+    if message.is_empty() {
+        "command exited without an error message".to_owned()
+    } else {
+        message
+    }
+}
+
+fn update_check_status(result: &UpdateCheckResult) -> String {
+    let current = env!("CARGO_PKG_VERSION");
+    if is_newer_release(&result.latest_tag, current) {
+        format!(
+            "Update available: {} (current {}). {}",
+            result.latest_tag, current, result.release_url
+        )
+    } else {
+        format!("Genesis is up to date ({current})")
+    }
+}
+
+fn is_newer_release(latest: &str, current: &str) -> bool {
+    let latest = version_numbers(latest);
+    let current = version_numbers(current);
+    let max_len = latest.len().max(current.len());
+    for index in 0..max_len {
+        let latest_part = latest.get(index).copied().unwrap_or(0);
+        let current_part = current.get(index).copied().unwrap_or(0);
+        if latest_part != current_part {
+            return latest_part > current_part;
+        }
+    }
+    false
+}
+
+fn version_numbers(version: &str) -> Vec<u64> {
+    version
+        .trim()
+        .trim_start_matches(['v', 'V'])
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u64>().ok())
+        .collect()
+}
+
+fn selected_tab_after_removal(
+    open_tabs: &[String],
+    removed_index: Option<usize>,
+) -> Option<String> {
+    let removed_index = removed_index?;
+    if open_tabs.is_empty() {
+        None
+    } else {
+        open_tabs
+            .get(removed_index)
+            .or_else(|| {
+                removed_index
+                    .checked_sub(1)
+                    .and_then(|index| open_tabs.get(index))
+            })
+            .cloned()
     }
 }

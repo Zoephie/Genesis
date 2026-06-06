@@ -1831,6 +1831,7 @@ pub(super) fn draw_shader_grid_row_readonly(
     let mut block_confirm = None;
     let mut open_request = None;
     let mut tool_import = None;
+    let mut bitmap_reimport = None;
     let mut buffers = HashMap::new();
     let mut color_request = None;
     let mut block_clip_request = None;
@@ -1846,6 +1847,7 @@ pub(super) fn draw_shader_grid_row_readonly(
         block_confirm: &mut block_confirm,
         open_request: &mut open_request,
         tool_import: &mut tool_import,
+        bitmap_reimport: &mut bitmap_reimport,
         shader_ops: &mut shader_ops,
         shader_param_ops: &mut shader_param_ops,
         color_request: &mut color_request,
@@ -2263,6 +2265,7 @@ pub(super) fn draw_shader_editable_value(
                         .text_color(MATERIAL_TEXT)
                         .font(egui::TextStyle::Monospace),
                 );
+                text_edit_cursor_to_start_on_tab_focus(ui, &resp);
                 if resp.lost_focus() && buffer.trim() != current.trim() {
                     if let Ok(v) = buffer.trim().parse::<f32>() {
                         commit_val = Some(v);
@@ -2378,6 +2381,7 @@ pub(super) fn draw_shader_editable_value(
                         .text_color(MATERIAL_TEXT)
                         .font(egui::TextStyle::Monospace),
                 );
+                text_edit_cursor_to_start_on_tab_focus(ui, &resp);
                 if resp.lost_focus() && buffer.trim() != current.trim() {
                     commit = Some(buffer.trim().to_owned());
                 }
@@ -2587,6 +2591,7 @@ pub(super) fn draw_shader_editable_value(
                         .text_color(MATERIAL_TEXT)
                         .font(egui::TextStyle::Monospace),
                 );
+                text_edit_cursor_to_start_on_tab_focus(ui, &resp);
                 if resp.lost_focus() && buffer.trim() != current.trim() {
                     if let Ok(v) = buffer.trim().parse::<f32>() {
                         commit_val = Some(v);
@@ -2623,6 +2628,7 @@ pub(super) fn draw_shader_editable_value(
                         .text_color(MATERIAL_TEXT)
                         .font(egui::TextStyle::Monospace),
                 );
+                text_edit_cursor_to_start_on_tab_focus(ui, &resp);
                 if resp.lost_focus() && buffer.trim() != current.trim() {
                     commit = Some(buffer.trim().to_owned());
                 }

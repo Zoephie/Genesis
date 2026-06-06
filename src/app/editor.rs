@@ -490,6 +490,47 @@ pub(super) fn parse_gui_field_value(
             .map(TagFieldData::Tag)
             .ok_or_else(|| "expected 1..=4 ASCII group tag".to_owned()),
         TagFieldType::Angle => parse_value(trimmed, "f32").map(TagFieldData::Angle),
+        TagFieldType::ShortIntegerBounds => {
+            let (lower, upper) = parse_short_bounds(trimmed, "short bounds")?;
+            Ok(TagFieldData::ShortIntegerBounds(
+                blam_tags::math::ShortBounds { lower, upper },
+            ))
+        }
+        TagFieldType::AngleBounds => {
+            let (lower, upper) = parse_float_bounds(trimmed, "angle bounds")?;
+            Ok(TagFieldData::AngleBounds(blam_tags::math::AngleBounds {
+                lower,
+                upper,
+            }))
+        }
+        TagFieldType::RealBounds => {
+            let (lower, upper) = parse_float_bounds(trimmed, "real bounds")?;
+            Ok(TagFieldData::RealBounds(blam_tags::math::RealBounds {
+                lower,
+                upper,
+            }))
+        }
+        TagFieldType::FractionBounds => {
+            let (lower, upper) = parse_float_bounds(trimmed, "fraction bounds")?;
+            Ok(TagFieldData::FractionBounds(
+                blam_tags::math::FractionBounds { lower, upper },
+            ))
+        }
+        TagFieldType::RealVector2d => {
+            let [i, j] = parse_float_channels::<2>(trimmed, "real vector 2d")?;
+            Ok(TagFieldData::RealVector2d(blam_tags::math::RealVector2d {
+                i,
+                j,
+            }))
+        }
+        TagFieldType::RealVector3d => {
+            let [i, j, k] = parse_float_channels::<3>(trimmed, "real vector 3d")?;
+            Ok(TagFieldData::RealVector3d(blam_tags::math::RealVector3d {
+                i,
+                j,
+                k,
+            }))
+        }
         TagFieldType::Real => parse_value(trimmed, "f32").map(TagFieldData::Real),
         TagFieldType::RealSlider => parse_value(trimmed, "f32").map(TagFieldData::RealSlider),
         TagFieldType::RealFraction => parse_value(trimmed, "f32").map(TagFieldData::RealFraction),
@@ -634,6 +675,79 @@ pub(super) fn parse_color_channels<const N: usize>(input: &str) -> Result<[f32; 
         .map_err(|_: Vec<f32>| format!("expected {N} comma-separated color channels"))
 }
 
+pub(super) fn parse_float_channels<const N: usize>(
+    input: &str,
+    expected: &str,
+) -> Result<[f32; N], String> {
+    let parts = if input.contains(',') {
+        input
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+    } else {
+        input.split_whitespace().collect::<Vec<_>>()
+    };
+    let values = parts
+        .into_iter()
+        .map(|part| part.parse::<f32>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| format!("expected {N} values for {expected}"))?;
+    values
+        .try_into()
+        .map_err(|_: Vec<f32>| format!("expected {N} values for {expected}"))
+}
+
+pub(super) fn parse_float_bounds(input: &str, expected: &str) -> Result<(f32, f32), String> {
+    let (lower, upper) = parse_bounds_parts(input, expected)?;
+    Ok((
+        lower
+            .parse()
+            .map_err(|_| format!("expected {expected} as lower..upper"))?,
+        upper
+            .parse()
+            .map_err(|_| format!("expected {expected} as lower..upper"))?,
+    ))
+}
+
+pub(super) fn parse_short_bounds(input: &str, expected: &str) -> Result<(i16, i16), String> {
+    let (lower, upper) = parse_bounds_parts(input, expected)?;
+    Ok((
+        lower
+            .parse()
+            .map_err(|_| format!("expected {expected} as lower..upper"))?,
+        upper
+            .parse()
+            .map_err(|_| format!("expected {expected} as lower..upper"))?,
+    ))
+}
+
+pub(super) fn parse_bounds_parts<'a>(
+    input: &'a str,
+    expected: &str,
+) -> Result<(&'a str, &'a str), String> {
+    if let Some((lower, upper)) = input.split_once("..") {
+        return Ok((lower.trim(), upper.trim()));
+    }
+    if let Some((lower, upper)) = input.split_once(" to ") {
+        return Ok((lower.trim(), upper.trim()));
+    }
+
+    let parts = if input.contains(',') {
+        input
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+    } else {
+        input.split_whitespace().collect::<Vec<_>>()
+    };
+    let [lower, upper]: [&str; 2] = parts
+        .try_into()
+        .map_err(|_| format!("expected {expected} as lower..upper"))?;
+    Ok((lower, upper))
+}
+
 pub(super) fn parse_none_string(input: &str) -> String {
     if input.eq_ignore_ascii_case("none") {
         String::new()
@@ -764,7 +878,12 @@ pub(super) fn extension_to_group_tag(extension: &str) -> Option<u32> {
     let fourcc = match extension {
         "material" => "mat",
         "material_shader" => "mats",
+        "material_effects" => "foot",
+        "object" => "obje",
         "model" => "hlmt",
+        "character" => "char",
+        "style" => "styl",
+        "unit" => "unit",
         "render_model" => "mode",
         "collision_model" => "coll",
         "physics_model" => "phmo",
@@ -772,13 +891,31 @@ pub(super) fn extension_to_group_tag(extension: &str) -> Option<u32> {
         "biped" => "bipd",
         "vehicle" => "vehi",
         "weapon" => "weap",
+        "equipment" => "eqip",
+        "item" => "item",
+        "giant" => "gint",
+        "creature" => "crea",
         "scenery" => "scen",
         "crate" => "crat",
         "bitmap" => "bitm",
         "scenario_structure_bsp" => "sbsp",
         "scenario" => "scnr",
+        "projectile" => "proj",
         "effect" => "effe",
+        "effect_scenery" => "efsc",
+        "damage_effect" => "jpt!",
         "sound" => "snd!",
+        "sound_looping" => "lsnd",
+        "sound_scenery" => "ssce",
+        "dialogue" => "udlg",
+        "light" => "ligh",
+        "lens_flare" => "lens",
+        "camera_track" => "trak",
+        "device" => "devi",
+        "device_control" => "ctrl",
+        "device_machine" => "mach",
+        "device_terminal" => "term",
+        "globals" => "matg",
         "shader" => "rmsh",
         "shader_terrain" => "rmtr",
         "shader_water" => "rmw ",
@@ -828,6 +965,15 @@ pub(super) fn draw_bitmap_tag(
     draw_tag_metadata(ui, tag, names);
     ui.add_space(6.0);
     ui.horizontal(|ui| {
+        let can_reimport = bitmap_reimport_data_path(entry, edit.tags_root).is_some();
+        if ui
+            .add_enabled(can_reimport, egui::Button::new("Reimport"))
+            .on_hover_text("Run tool bitmaps for this bitmap source path, then reload the tag")
+            .clicked()
+        {
+            *edit.bitmap_reimport = Some(entry.key.clone());
+        }
+        ui.separator();
         ui.selectable_value(&mut preview.active_tab, BitmapPanelTab::Fields, "Fields");
         ui.selectable_value(
             &mut preview.active_tab,
@@ -848,6 +994,20 @@ pub(super) fn draw_bitmap_tag(
         }
         BitmapPanelTab::Texture => draw_bitmap_preview(ui, ctx, tag, entry, preview),
     }
+}
+
+pub(super) fn bitmap_reimport_data_path(
+    entry: &TagEntry,
+    tags_root: Option<&Path>,
+) -> Option<String> {
+    let TagEntryLocation::LooseFile(path) = &entry.location else {
+        return None;
+    };
+    let tags_root = tags_root?;
+    let rel = path.strip_prefix(tags_root).ok()?;
+    let mut source = rel.to_path_buf();
+    source.set_extension("");
+    Some(source.to_string_lossy().replace('/', "\\"))
 }
 
 pub(super) fn draw_bitmap_preview(

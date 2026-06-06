@@ -71,11 +71,11 @@ impl TagNameIndex {
     /// even when the on-disk `definitions/` folder can't be located at runtime.
     pub fn embedded_fallback() -> Self {
         const EMBEDDED: &[&str] = &[
-            include_str!("../definitions/halo3_mcc/_meta.json"),
-            include_str!("../definitions/halo3odst_mcc/_meta.json"),
-            include_str!("../definitions/haloreach_mcc/_meta.json"),
-            include_str!("../definitions/halo4_mcc/_meta.json"),
-            include_str!("../definitions/halo2amp_mcc/_meta.json"),
+            include_str!("../blam-tags/definitions/halo3_mcc/_meta.json"),
+            include_str!("../blam-tags/definitions/halo3odst_mcc/_meta.json"),
+            include_str!("../blam-tags/definitions/haloreach_mcc/_meta.json"),
+            include_str!("../blam-tags/definitions/halo4_mcc/_meta.json"),
+            include_str!("../blam-tags/definitions/halo2amp_mcc/_meta.json"),
         ];
         let mut index = TagNameIndex::default();
         for json in EMBEDDED {

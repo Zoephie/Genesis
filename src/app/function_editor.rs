@@ -90,10 +90,9 @@ pub(super) fn seeded_name_combo(ui: &mut Ui, id: &str, value: &mut String, edita
                 }
             }
         });
-    if ui
-        .add(egui::TextEdit::singleline(value).desired_width(90.0))
-        .changed()
-    {
+    let response = ui.add(egui::TextEdit::singleline(value).desired_width(90.0));
+    text_edit_cursor_to_start_on_tab_focus(ui, &response);
+    if response.changed() {
         changed = true;
     }
     changed

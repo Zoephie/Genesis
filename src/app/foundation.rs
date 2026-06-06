@@ -451,7 +451,7 @@ pub(super) fn draw_foundation_block(
         },
     );
 
-    handle_block_actions(ui, edit, path_prefix, sel, count, &actions);
+    handle_block_actions(ui, edit, path_prefix, sel, count, expert_mode, &actions);
 
     // Copy the selected element, or the whole block, onto the clipboard.
     let copy_indices: Option<Vec<usize>> = if actions.copy {
@@ -523,6 +523,7 @@ pub(super) fn handle_block_actions(
     path: &str,
     sel: usize,
     count: usize,
+    expert_mode: bool,
     actions: &BlockHeaderActions,
 ) {
     if let Some(new_sel) = actions.new_selection {
@@ -551,13 +552,21 @@ pub(super) fn handle_block_actions(
         set_block_selected_index(ui, edit, path, sel + 1);
     }
     if actions.delete && count > 0 {
-        *edit.block_confirm = Some(BlockConfirm {
-            tag_key: edit.tag_key.to_owned(),
-            path: path.to_owned(),
-            kind: BlockOpKind::Delete(sel),
-            message: format!("Delete element {sel} of {count} from this block?"),
-            confirm_label: "Delete".to_owned(),
-        });
+        if expert_mode {
+            edit.block_ops.push(BlockOp {
+                path: path.to_owned(),
+                kind: BlockOpKind::Delete(sel),
+            });
+            set_block_selected_index(ui, edit, path, sel.saturating_sub(1));
+        } else {
+            *edit.block_confirm = Some(BlockConfirm {
+                tag_key: edit.tag_key.to_owned(),
+                path: path.to_owned(),
+                kind: BlockOpKind::Delete(sel),
+                message: format!("Delete element {sel} of {count} from this block?"),
+                confirm_label: "Delete".to_owned(),
+            });
+        }
     }
     if actions.delete_all && count > 0 {
         *edit.block_confirm = Some(BlockConfirm {
@@ -695,6 +704,7 @@ pub(super) fn draw_foundation_block_control(
     // At-capacity / empty gating mirrors Guerilla's enable rules.
     let can_edit = editable && allow_structural;
     let has_sel = count > 0;
+    let mut selector_active = false;
 
     ui.allocate_new_ui(
         egui::UiBuilder::new().max_rect(row_rect.shrink2(Vec2::new(4.0, 3.0))),
@@ -768,7 +778,7 @@ pub(super) fn draw_foundation_block_control(
                 // Instance selector dropdown — built lazily (only when open).
                 let combo_width = foundation_selected_width(row_width);
                 if has_sel {
-                    egui::ComboBox::from_id_salt((
+                    let combo_response = egui::ComboBox::from_id_salt((
                         "block_instance",
                         view_scope,
                         tag_key,
@@ -778,6 +788,7 @@ pub(super) fn draw_foundation_block_control(
                     .selected_text(truncate_for_cell(selected_label, combo_width - 24.0))
                     .width(combo_width)
                     .show_ui(ui, |ui| {
+                        selector_active |= ui.rect_contains_pointer(ui.max_rect());
                         // Cap the rendered list for very large blocks.
                         let cap = count.min(2000);
                         for i in 0..cap {
@@ -796,6 +807,8 @@ pub(super) fn draw_foundation_block_control(
                             );
                         }
                     });
+                    selector_active |=
+                        combo_response.response.hovered() || combo_response.response.has_focus();
                 } else {
                     foundation_header_value_cell(ui, "NONE", combo_width);
                 }
@@ -840,6 +853,32 @@ pub(super) fn draw_foundation_block_control(
         },
     );
 
+    if has_sel && selector_active {
+        let navigation_delta = ui.input(|input| {
+            if input.key_pressed(egui::Key::ArrowUp) {
+                -1
+            } else if input.key_pressed(egui::Key::ArrowDown) {
+                1
+            } else if input.raw_scroll_delta.y > f32::EPSILON {
+                -1
+            } else if input.raw_scroll_delta.y < -f32::EPSILON {
+                1
+            } else {
+                0
+            }
+        });
+        if count > 1 {
+            if navigation_delta < 0 && selected_index > 0 {
+                actions.new_selection = Some(selected_index - 1);
+            } else if navigation_delta > 0 && selected_index + 1 < count {
+                actions.new_selection = Some(selected_index + 1);
+            }
+        }
+        if ui.input(|input| input.raw_scroll_delta.y.abs() > f32::EPSILON) {
+            consume_mouse_wheel(ui);
+        }
+    }
+
     state.store(ui.ctx());
 
     if count == 0 {
@@ -860,6 +899,16 @@ pub(super) fn draw_foundation_block_control(
     });
 
     actions
+}
+
+pub(super) fn consume_mouse_wheel(ui: &Ui) {
+    ui.input_mut(|input| {
+        input
+            .events
+            .retain(|event| !matches!(event, egui::Event::MouseWheel { .. }));
+        input.raw_scroll_delta = Vec2::ZERO;
+        input.smooth_scroll_delta = Vec2::ZERO;
+    });
 }
 
 pub(super) fn foundation_header_toggle_cell(
@@ -1048,13 +1097,29 @@ pub(super) fn draw_foundation_value_row(
         return;
     }
 
-    if let Some(parts) = foundation_value_parts(value) {
-        draw_foundation_multi_value_row(
+    if let Some((lower, upper)) = foundation_bounds_values(value) {
+        draw_foundation_bounds_row(
+            ui,
+            meta,
+            &lower,
+            &upper,
+            field_suffix(meta, type_name).as_str(),
+            depth,
+            path,
+            edit,
+        );
+        return;
+    }
+
+    if let Some(parts) = foundation_editable_component_parts(value) {
+        draw_foundation_component_edit_row(
             ui,
             meta,
             &parts,
             field_suffix(meta, type_name).as_str(),
             depth,
+            path,
+            edit,
         );
         return;
     }
@@ -1072,6 +1137,18 @@ pub(super) fn draw_foundation_value_row(
         );
         return;
     }
+
+    if let Some(parts) = foundation_value_parts(value) {
+        draw_foundation_multi_value_row(
+            ui,
+            meta,
+            &parts,
+            field_suffix(meta, type_name).as_str(),
+            depth,
+        );
+        return;
+    }
+
     draw_foundation_meta_text_row(
         ui,
         meta,
@@ -1161,6 +1238,142 @@ pub(super) fn draw_foundation_multi_value_row(
         }
         draw_field_help(ui, meta);
     });
+}
+
+pub(super) fn draw_foundation_bounds_row(
+    ui: &mut Ui,
+    meta: &FieldDisplayMeta,
+    lower_value: &str,
+    upper_value: &str,
+    suffix: &str,
+    depth: usize,
+    path: &str,
+    edit: &mut FieldEditContext<'_>,
+) {
+    let indent = depth as f32 * 12.0;
+    let buffer_key = format!("{}|{}", edit.tag_key, path);
+    let lower_key = format!("{buffer_key}|lower");
+    let upper_key = format!("{buffer_key}|upper");
+    let lower_id = edit.widget_id(("bounds_lower", &buffer_key));
+    let upper_id = edit.widget_id(("bounds_upper", &buffer_key));
+    let lower_has_focus = ui.memory(|memory| memory.has_focus(lower_id));
+    let upper_has_focus = ui.memory(|memory| memory.has_focus(upper_id));
+    let mut lower = edit
+        .buffers
+        .remove(&lower_key)
+        .unwrap_or_else(|| lower_value.to_owned());
+    let mut upper = edit
+        .buffers
+        .remove(&upper_key)
+        .unwrap_or_else(|| upper_value.to_owned());
+    if !lower_has_focus && !upper_has_focus {
+        if lower != lower_value {
+            lower = lower_value.to_owned();
+        }
+        if upper != upper_value {
+            upper = upper_value.to_owned();
+        }
+    }
+
+    ui.horizontal(|ui| {
+        ui.add_space(indent);
+        foundation_label_cell(ui, &meta.label);
+        let editable = edit.editable && !meta.read_only;
+        if editable {
+            let lower_response = foundation_text_edit_cell(ui, &mut lower, 92.0, lower_id);
+            ui.label(RichText::new("to").color(subtle_dark()).small());
+            let upper_response = foundation_text_edit_cell(ui, &mut upper, 92.0, upper_id);
+            let commit = (lower_response.lost_focus() || upper_response.lost_focus())
+                && (lower.trim() != lower_value.trim() || upper.trim() != upper_value.trim());
+            if commit {
+                edit.pending.push(PendingFieldEdit {
+                    path: path.to_owned(),
+                    input: format!("{}..{}", lower.trim(), upper.trim()),
+                });
+            }
+        } else {
+            foundation_input_cell(ui, lower_value, 92.0);
+            ui.label(RichText::new("to").color(subtle_dark()).small());
+            foundation_input_cell(ui, upper_value, 92.0);
+        }
+        if !suffix.is_empty() {
+            ui.label(RichText::new(suffix).color(subtle_dark()).small());
+        }
+        draw_field_help(ui, meta);
+    });
+
+    edit.buffers.insert(lower_key, lower);
+    edit.buffers.insert(upper_key, upper);
+}
+
+pub(super) fn draw_foundation_component_edit_row(
+    ui: &mut Ui,
+    meta: &FieldDisplayMeta,
+    parts: &[(String, String)],
+    suffix: &str,
+    depth: usize,
+    path: &str,
+    edit: &mut FieldEditContext<'_>,
+) {
+    let indent = depth as f32 * 12.0;
+    let buffer_key = format!("{}|{}", edit.tag_key, path);
+    let mut values = Vec::with_capacity(parts.len());
+    let mut responses = Vec::with_capacity(parts.len());
+    let ids = parts
+        .iter()
+        .map(|(label, _)| edit.widget_id(("component", &buffer_key, label)))
+        .collect::<Vec<_>>();
+    let any_focus = ids
+        .iter()
+        .any(|id| ui.memory(|memory| memory.has_focus(*id)));
+    for (label, value) in parts {
+        let key = format!("{buffer_key}|component|{label}");
+        let mut buffer = edit.buffers.remove(&key).unwrap_or_else(|| value.clone());
+        if !any_focus && buffer != *value {
+            buffer = value.clone();
+        }
+        values.push((label.clone(), value.clone(), key, buffer));
+    }
+
+    ui.horizontal(|ui| {
+        ui.add_space(indent);
+        foundation_label_cell(ui, &meta.label);
+        let editable = edit.editable && !meta.read_only;
+        for (index, (label, _, _, buffer)) in values.iter_mut().enumerate() {
+            if !label.is_empty() {
+                ui.label(RichText::new(label.as_str()).color(subtle_dark()).small());
+            }
+            if editable {
+                responses.push(foundation_text_edit_cell(ui, buffer, 92.0, ids[index]));
+            } else {
+                foundation_input_cell(ui, buffer, 92.0);
+            }
+        }
+        if editable {
+            let changed = values
+                .iter()
+                .any(|(_, value, _, buffer)| buffer.trim() != value.trim());
+            let committed = responses.iter().any(egui::Response::lost_focus);
+            if committed && changed {
+                edit.pending.push(PendingFieldEdit {
+                    path: path.to_owned(),
+                    input: values
+                        .iter()
+                        .map(|(_, _, _, buffer)| buffer.trim())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                });
+            }
+        }
+        if !suffix.is_empty() {
+            ui.label(RichText::new(suffix).color(subtle_dark()).small());
+        }
+        draw_field_help(ui, meta);
+    });
+
+    for (_, _, key, buffer) in values {
+        edit.buffers.insert(key, buffer);
+    }
 }
 
 pub(super) fn draw_foundation_text_row(
@@ -1409,8 +1622,9 @@ pub(super) fn choose_tag_reference_input(
         .pick_file()?;
     let rel = picked.strip_prefix(tags_root).ok()?;
     let extension = rel.extension().and_then(|ext| ext.to_str())?;
-    extension_to_group_tag(extension)?;
-    Some(rel.to_string_lossy().replace('/', "\\"))
+    let group_tag = extension_to_group_tag(extension)?;
+    let path = rel.with_extension("").to_string_lossy().replace('/', "\\");
+    Some(format!("{}:{path}", format_group_tag(group_tag)))
 }
 
 pub(super) fn draw_foundation_flags_row(
@@ -1684,23 +1898,39 @@ pub(super) fn foundation_text_edit_cell(
     width: f32,
     id: egui::Id,
 ) -> egui::Response {
-    ui.scope(|ui| {
-        ui.visuals_mut().widgets.inactive.bg_fill = foundation_input();
-        ui.visuals_mut().widgets.hovered.bg_fill = foundation_input();
-        ui.visuals_mut().widgets.active.bg_fill = foundation_input();
-        ui.visuals_mut().widgets.inactive.fg_stroke = Stroke::new(1.0, text_dark());
-        ui.visuals_mut().widgets.hovered.fg_stroke = Stroke::new(1.0, text_dark());
-        ui.visuals_mut().widgets.active.fg_stroke = Stroke::new(1.0, text_dark());
-        ui.add_sized(
-            [width, 24.0],
-            egui::TextEdit::singleline(text)
-                .id(id)
-                .font(TextStyle::Monospace)
-                .text_color(text_dark())
-                .margin(Vec2::new(4.0, 2.0)),
-        )
-    })
-    .inner
+    let response = ui
+        .scope(|ui| {
+            ui.visuals_mut().widgets.inactive.bg_fill = foundation_input();
+            ui.visuals_mut().widgets.hovered.bg_fill = foundation_input();
+            ui.visuals_mut().widgets.active.bg_fill = foundation_input();
+            ui.visuals_mut().widgets.inactive.fg_stroke = Stroke::new(1.0, text_dark());
+            ui.visuals_mut().widgets.hovered.fg_stroke = Stroke::new(1.0, text_dark());
+            ui.visuals_mut().widgets.active.fg_stroke = Stroke::new(1.0, text_dark());
+            ui.add_sized(
+                [width, 24.0],
+                egui::TextEdit::singleline(text)
+                    .id(id)
+                    .font(TextStyle::Monospace)
+                    .text_color(text_dark())
+                    .margin(Vec2::new(4.0, 2.0)),
+            )
+        })
+        .inner;
+    text_edit_cursor_to_start_on_tab_focus(ui, &response);
+    response
+}
+
+pub(super) fn text_edit_cursor_to_start_on_tab_focus(ui: &Ui, response: &egui::Response) {
+    if response.gained_focus() && ui.input(|input| input.key_pressed(egui::Key::Tab)) {
+        if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), response.id) {
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::one(
+                    egui::text::CCursor::new(0),
+                )));
+            state.store(ui.ctx(), response.id);
+        }
+    }
 }
 
 pub(super) fn foundation_value_width(value: &str, available: f32) -> f32 {
@@ -1783,6 +2013,33 @@ pub(super) fn foundation_value_parts(value: &TagFieldData) -> Option<Vec<(String
         | TagFieldData::FractionBounds(b) => {
             pair("low", fmt_real(b.lower), "high", fmt_real(b.upper))
         }
+        _ => None,
+    }
+}
+
+pub(super) fn foundation_bounds_values(value: &TagFieldData) -> Option<(String, String)> {
+    match value {
+        TagFieldData::ShortIntegerBounds(b) => Some((b.lower.to_string(), b.upper.to_string())),
+        TagFieldData::AngleBounds(b)
+        | TagFieldData::RealBounds(b)
+        | TagFieldData::FractionBounds(b) => Some((fmt_real(b.lower), fmt_real(b.upper))),
+        _ => None,
+    }
+}
+
+pub(super) fn foundation_editable_component_parts(
+    value: &TagFieldData,
+) -> Option<Vec<(String, String)>> {
+    match value {
+        TagFieldData::RealVector2d(v) => Some(vec![
+            ("i".to_owned(), fmt_real(v.i)),
+            ("j".to_owned(), fmt_real(v.j)),
+        ]),
+        TagFieldData::RealVector3d(v) => Some(vec![
+            ("i".to_owned(), fmt_real(v.i)),
+            ("j".to_owned(), fmt_real(v.j)),
+            ("k".to_owned(), fmt_real(v.k)),
+        ]),
         _ => None,
     }
 }

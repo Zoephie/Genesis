@@ -31,6 +31,11 @@ use crate::source::{
     resolve_folder_root, scan_folder_subtree_entries,
 };
 
+pub(super) const GENESIS_GITHUB_URL: &str = "https://github.com/Zoephie/Genesis";
+pub(super) const GENESIS_LATEST_RELEASE_API: &str =
+    "https://api.github.com/repos/Zoephie/Genesis/releases/latest";
+pub(super) const GENESIS_RELEASES_URL: &str = "https://github.com/Zoephie/Genesis/releases";
+
 mod style;
 use style::*;
 mod state;
@@ -85,10 +90,12 @@ pub struct Genesis {
     source_generation: u64,
     browser_mode: BrowserMode,
     show_browser_prefixes: bool,
+    double_click_to_open_tags: bool,
     expert_mode: bool,
     dark_mode: bool,
     saved_prefs: GuiPrefs,
     settings_open: bool,
+    about_open: bool,
     blender_path: Option<PathBuf>,
     blender_path_input: String,
     color_popup: Option<MaterialColorPopup>,
@@ -155,10 +162,12 @@ impl Genesis {
             source_generation: 0,
             browser_mode: prefs.browser_mode,
             show_browser_prefixes: prefs.show_browser_prefixes,
+            double_click_to_open_tags: prefs.double_click_to_open_tags,
             expert_mode: prefs.expert_mode,
             dark_mode: prefs.dark_mode,
             saved_prefs: prefs.clone(),
             settings_open: false,
+            about_open: false,
             blender_path_input: prefs
                 .blender_path
                 .as_ref()
@@ -172,6 +181,9 @@ impl Genesis {
             terminal: TerminalState {
                 input: String::new(),
                 lines: Vec::new(),
+                history: Vec::new(),
+                history_cursor: None,
+                refocus_input: false,
                 running: false,
                 scroll_to_bottom: false,
             },
@@ -200,29 +212,36 @@ impl Genesis {
 }
 
 /// Locate the bundled `definitions/` folder, which carries the per-game group
-/// name → file extension index. A plain relative `"definitions"` only works
-/// when the process is launched from the workspace root; here we also probe
-/// alongside (and a few levels above) the executable so a shipped binary — or
-/// `cargo run` from a sub-directory — still resolves it. Without this the name
-/// index is empty, which breaks tag-reference Open and the geometry Import
-/// button (both rely on resolving the referenced group's extension).
+/// name → file extension index. Source builds use the submodule copy at
+/// `blam-tags/definitions`; release builds may put `definitions` beside the
+/// executable. Without this the name index is empty, which breaks tag-reference
+/// Open and the geometry Import button (both rely on resolving the referenced
+/// group's extension).
 pub(super) fn locate_definitions_root() -> PathBuf {
-    let cwd = PathBuf::from("definitions");
-    if cwd.is_dir() {
-        return cwd;
+    for candidate in [
+        PathBuf::from("blam-tags").join("definitions"),
+        PathBuf::from("definitions"),
+    ] {
+        if candidate.is_dir() {
+            return candidate;
+        }
     }
     if let Ok(exe) = std::env::current_exe() {
         let mut dir = exe.parent().map(Path::to_path_buf);
         for _ in 0..4 {
             let Some(d) = dir else { break };
-            let candidate = d.join("definitions");
-            if candidate.is_dir() {
-                return candidate;
+            for candidate in [
+                d.join("definitions"),
+                d.join("blam-tags").join("definitions"),
+            ] {
+                if candidate.is_dir() {
+                    return candidate;
+                }
             }
             dir = d.parent().map(Path::to_path_buf);
         }
     }
-    cwd
+    PathBuf::from("blam-tags").join("definitions")
 }
 
 /// Decode an embedded `.ico` into an egui texture for a toolbar button.

@@ -7,11 +7,21 @@ pub(super) fn draw_tree(
     selected: Option<&str>,
     filter: &str,
     show_prefixes: bool,
+    double_click_to_open: bool,
     groups_mode: bool,
 ) -> Option<BrowserAction> {
     let mut clicked = None;
-    clicked = clicked
-        .or_else(|| draw_entry_list(ui, &tree.entries, entries, selected, filter, show_prefixes));
+    clicked = clicked.or_else(|| {
+        draw_entry_list(
+            ui,
+            &tree.entries,
+            entries,
+            selected,
+            filter,
+            show_prefixes,
+            double_click_to_open,
+        )
+    });
     for node in &tree.children {
         clicked = clicked.or_else(|| {
             draw_tree_node(
@@ -21,6 +31,7 @@ pub(super) fn draw_tree(
                 selected,
                 filter,
                 show_prefixes,
+                double_click_to_open,
                 groups_mode,
             )
         });
@@ -38,11 +49,21 @@ pub(super) fn draw_tree_lazy(
     selected: Option<&str>,
     filter: &str,
     show_prefixes: bool,
+    double_click_to_open: bool,
     status_update: &mut Option<String>,
 ) -> Option<BrowserAction> {
     let mut clicked = None;
-    clicked = clicked
-        .or_else(|| draw_entry_list(ui, &tree.entries, entries, selected, filter, show_prefixes));
+    clicked = clicked.or_else(|| {
+        draw_entry_list(
+            ui,
+            &tree.entries,
+            entries,
+            selected,
+            filter,
+            show_prefixes,
+            double_click_to_open,
+        )
+    });
     for node in &mut tree.children {
         clicked = clicked.or_else(|| {
             draw_tree_node_lazy(
@@ -55,6 +76,7 @@ pub(super) fn draw_tree_lazy(
                 selected,
                 filter,
                 show_prefixes,
+                double_click_to_open,
                 status_update,
             )
         });
@@ -73,6 +95,7 @@ pub(super) fn draw_tree_node_lazy(
     selected: Option<&str>,
     filter: &str,
     show_prefixes: bool,
+    double_click_to_open: bool,
     status_update: &mut Option<String>,
 ) -> Option<BrowserAction> {
     if !filter.is_empty() && !lazy_node_matches(node, entries, filter) {
@@ -107,11 +130,25 @@ pub(super) fn draw_tree_node_lazy(
                 }
             }
             if clicked.is_none() {
-                clicked =
-                    draw_entry_list(ui, &node.entries, entries, selected, filter, show_prefixes);
+                clicked = draw_entry_list(
+                    ui,
+                    &node.entries,
+                    entries,
+                    selected,
+                    filter,
+                    show_prefixes,
+                    double_click_to_open,
+                );
             } else {
-                let _ =
-                    draw_entry_list(ui, &node.entries, entries, selected, filter, show_prefixes);
+                let _ = draw_entry_list(
+                    ui,
+                    &node.entries,
+                    entries,
+                    selected,
+                    filter,
+                    show_prefixes,
+                    double_click_to_open,
+                );
             }
             for child in &mut node.children {
                 if clicked.is_none() {
@@ -125,6 +162,7 @@ pub(super) fn draw_tree_node_lazy(
                         selected,
                         filter,
                         show_prefixes,
+                        double_click_to_open,
                         status_update,
                     );
                 }
@@ -159,6 +197,7 @@ pub(super) fn draw_tree_node(
     selected: Option<&str>,
     filter: &str,
     show_prefixes: bool,
+    double_click_to_open: bool,
     groups_mode: bool,
 ) -> Option<BrowserAction> {
     if !filter.is_empty() && !node_matches(node, entries, filter) {
@@ -177,11 +216,25 @@ pub(super) fn draw_tree_node(
         .default_open(!filter.is_empty())
         .show(ui, |ui| {
             if clicked.is_none() {
-                clicked =
-                    draw_entry_list(ui, &node.entries, entries, selected, filter, show_prefixes);
+                clicked = draw_entry_list(
+                    ui,
+                    &node.entries,
+                    entries,
+                    selected,
+                    filter,
+                    show_prefixes,
+                    double_click_to_open,
+                );
             } else {
-                let _ =
-                    draw_entry_list(ui, &node.entries, entries, selected, filter, show_prefixes);
+                let _ = draw_entry_list(
+                    ui,
+                    &node.entries,
+                    entries,
+                    selected,
+                    filter,
+                    show_prefixes,
+                    double_click_to_open,
+                );
             }
             for child in &node.children {
                 if clicked.is_none() {
@@ -192,6 +245,7 @@ pub(super) fn draw_tree_node(
                         selected,
                         filter,
                         show_prefixes,
+                        double_click_to_open,
                         groups_mode,
                     );
                 }
@@ -274,9 +328,17 @@ pub(super) fn draw_entry_list(
     selected: Option<&str>,
     filter: &str,
     show_prefixes: bool,
+    double_click_to_open: bool,
 ) -> Option<BrowserAction> {
     if filter.is_empty() && entry_indices.len() > MAX_BROWSER_ENTRIES_PER_NODE {
-        return draw_capped_entry_list(ui, entry_indices, entries, selected, show_prefixes);
+        return draw_capped_entry_list(
+            ui,
+            entry_indices,
+            entries,
+            selected,
+            show_prefixes,
+            double_click_to_open,
+        );
     }
 
     let mut clicked = None;
@@ -286,9 +348,9 @@ pub(super) fn draw_entry_list(
             continue;
         }
         if clicked.is_none() {
-            clicked = draw_entry(ui, entry, selected, show_prefixes);
+            clicked = draw_entry(ui, entry, selected, show_prefixes, double_click_to_open);
         } else {
-            let _ = draw_entry(ui, entry, selected, show_prefixes);
+            let _ = draw_entry(ui, entry, selected, show_prefixes, double_click_to_open);
         }
     }
     clicked
@@ -300,6 +362,7 @@ pub(super) fn draw_capped_entry_list(
     entries: &[TagEntry],
     selected: Option<&str>,
     show_prefixes: bool,
+    double_click_to_open: bool,
 ) -> Option<BrowserAction> {
     let mut clicked = None;
     let selected_index = selected.and_then(|selected| {
@@ -311,9 +374,9 @@ pub(super) fn draw_capped_entry_list(
     for &entry_index in entry_indices.iter().take(MAX_BROWSER_ENTRIES_PER_NODE) {
         let entry = &entries[entry_index];
         if clicked.is_none() {
-            clicked = draw_entry(ui, entry, selected, show_prefixes);
+            clicked = draw_entry(ui, entry, selected, show_prefixes, double_click_to_open);
         } else {
-            let _ = draw_entry(ui, entry, selected, show_prefixes);
+            let _ = draw_entry(ui, entry, selected, show_prefixes, double_click_to_open);
         }
     }
 
@@ -322,9 +385,9 @@ pub(super) fn draw_capped_entry_list(
             ui.label(RichText::new("...").color(subtle_dark()));
             let entry = &entries[entry_indices[position]];
             if clicked.is_none() {
-                clicked = draw_entry(ui, entry, selected, show_prefixes);
+                clicked = draw_entry(ui, entry, selected, show_prefixes, double_click_to_open);
             } else {
-                let _ = draw_entry(ui, entry, selected, show_prefixes);
+                let _ = draw_entry(ui, entry, selected, show_prefixes, double_click_to_open);
             }
         }
     }
@@ -350,6 +413,7 @@ pub(super) fn draw_entry(
     entry: &TagEntry,
     selected: Option<&str>,
     show_prefixes: bool,
+    double_click_to_open: bool,
 ) -> Option<BrowserAction> {
     let label = entry
         .display_path
@@ -367,9 +431,12 @@ pub(super) fn draw_entry(
             RichText::new(label).color(text_dark()),
         )
         .on_hover_text(&entry.display_path);
-    let mut action = response
-        .clicked()
-        .then(|| BrowserAction::Select(entry.key.clone()));
+    let open_requested = if double_click_to_open {
+        response.double_clicked()
+    } else {
+        response.clicked()
+    };
+    let mut action = open_requested.then(|| BrowserAction::Select(entry.key.clone()));
     response.context_menu(|ui| {
         if ui.button("Open with File Explorer").clicked() {
             action = Some(BrowserAction::OpenInExplorer(entry.key.clone()));

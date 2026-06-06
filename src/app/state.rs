@@ -6,6 +6,10 @@ pub(super) enum WorkerMessage {
         key: String,
         result: Result<TagFile, String>,
     },
+    BitmapReimportFinished {
+        key: String,
+        result: Result<TagFile, String>,
+    },
     ExportFinished(Result<String, String>),
     // Full recursive entry scan finished for a loose-folder source.
     AllEntriesScanned(Result<Vec<TagEntry>, String>),
@@ -13,11 +17,21 @@ pub(super) enum WorkerMessage {
     TerminalLine(String),
     // Terminal process finished.
     TerminalDone,
+    // GitHub latest-release lookup finished.
+    UpdateCheckFinished(Result<UpdateCheckResult, String>),
+}
+
+pub(super) struct UpdateCheckResult {
+    pub(super) latest_tag: String,
+    pub(super) release_url: String,
 }
 
 pub(super) struct TerminalState {
     pub(super) input: String,
     pub(super) lines: Vec<String>,
+    pub(super) history: Vec<String>,
+    pub(super) history_cursor: Option<usize>,
+    pub(super) refocus_input: bool,
     pub(super) running: bool,
     pub(super) scroll_to_bottom: bool,
 }
@@ -109,6 +123,7 @@ impl FilterCache {
 pub(super) struct GuiPrefs {
     pub(super) browser_mode: BrowserMode,
     pub(super) show_browser_prefixes: bool,
+    pub(super) double_click_to_open_tags: bool,
     pub(super) expert_mode: bool,
     pub(super) dark_mode: bool,
     pub(super) blender_path: Option<PathBuf>,
@@ -269,6 +284,8 @@ pub(super) struct FieldEditContext<'a> {
     pub(super) open_request: &'a mut Option<OpenTagRequest>,
     /// Set when the user clicks "Import" on a geometry tag-reference row.
     pub(super) tool_import: &'a mut Option<ToolImportRequest>,
+    /// Set when the user clicks "Reimport" on a bitmap tag.
+    pub(super) bitmap_reimport: &'a mut Option<String>,
     /// Shader-specific deferred ops (add animated parameter + init).
     pub(super) shader_ops: &'a mut Vec<ShaderOp>,
     /// Shader-specific deferred ops (create parameter entry + set real value).
@@ -342,6 +359,7 @@ impl Default for GuiPrefs {
         Self {
             browser_mode: BrowserMode::Folders,
             show_browser_prefixes: false,
+            double_click_to_open_tags: false,
             expert_mode: false,
             dark_mode: false,
             blender_path: None,

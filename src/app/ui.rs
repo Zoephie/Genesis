@@ -92,6 +92,14 @@ impl Genesis {
             .open(&mut open)
             .default_width(560.0)
             .show(ctx, |ui| {
+                ui.label(RichText::new("Browser").color(text_dark()).strong());
+                ui.add_space(4.0);
+                ui.checkbox(
+                    &mut self.double_click_to_open_tags,
+                    "Double-click to open tags",
+                );
+                ui.add_space(10.0);
+
                 ui.label(RichText::new("Blender").color(text_dark()).strong());
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
@@ -127,6 +135,38 @@ impl Genesis {
                 });
             });
         self.settings_open = open;
+    }
+
+    fn draw_about_window(&mut self, ctx: &egui::Context) {
+        if !self.about_open {
+            return;
+        }
+
+        let mut open = self.about_open;
+        egui::Window::new("About Genesis")
+            .id(egui::Id::new("about_genesis"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.heading(RichText::new("Genesis").color(text_dark()));
+                ui.label(
+                    RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION")))
+                        .color(subtle_dark()),
+                );
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.label(RichText::new("blam-tags created by Camden Smallwood").color(text_dark()));
+                ui.label(RichText::new("Genesis created by Zoephie Sinyard").color(text_dark()));
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.label(RichText::new("Source").color(text_dark()).strong());
+                ui.hyperlink_to(GENESIS_GITHUB_URL, GENESIS_GITHUB_URL);
+            });
+        self.about_open = open;
     }
 }
 
@@ -165,6 +205,16 @@ impl eframe::App for Genesis {
                         if ui.button("Save Current Tag    Ctrl+S").clicked() {
                             ui.close_menu();
                             self.save_current_tag();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.selected_key.is_some(),
+                                egui::Button::new("Save Current Tag As..."),
+                            )
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.save_current_tag_as();
                         }
                         // Regenerate Index: force a fresh full scan and
                         // overwrite the cached index file.
@@ -230,6 +280,16 @@ impl eframe::App for Genesis {
                         {
                             self.terminal_open = !self.terminal_open;
                             self.remember_terminal_open_for_game();
+                            ui.close_menu();
+                        }
+                    });
+                    ui.menu_button("Help", |ui| {
+                        if ui.button("About...").clicked() {
+                            self.about_open = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("Check for updates").clicked() {
+                            self.begin_check_for_updates(ctx.clone());
                             ui.close_menu();
                         }
                     });
@@ -331,11 +391,30 @@ impl eframe::App for Genesis {
                                         .font(egui::TextStyle::Monospace)
                                         .hint_text("tool <command> …"),
                                 );
+                                if self.terminal.refocus_input && !self.terminal.running {
+                                    resp.request_focus();
+                                    self.terminal.refocus_input = false;
+                                }
                                 let run_clicked = ui
                                     .add_enabled(!self.terminal.running, egui::Button::new("Run"))
                                     .clicked();
                                 let enter = resp.lost_focus()
                                     && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                if resp.has_focus() && !self.terminal.running {
+                                    let recall = ui.input(|i| {
+                                        if i.key_pressed(egui::Key::ArrowUp) {
+                                            -1
+                                        } else if i.key_pressed(egui::Key::ArrowDown) {
+                                            1
+                                        } else {
+                                            0
+                                        }
+                                    });
+                                    if recall != 0 {
+                                        self.recall_terminal_history(recall);
+                                        resp.request_focus();
+                                    }
+                                }
                                 if run_clicked || enter {
                                     self.begin_terminal_command(ctx.clone());
                                     // Refocus the input so the user can keep typing.
@@ -464,6 +543,7 @@ impl eframe::App for Genesis {
                     let filter = self.filter.trim().to_owned();
                     let mode = self.browser_mode;
                     let show_prefixes = self.show_browser_prefixes;
+                    let double_click_to_open = self.double_click_to_open_tags;
                     let mut status_update = None;
                     // Groups and filtered Folders use all_entries (background
                     // scan) so every tag is visible, not just visited folders.
@@ -520,6 +600,7 @@ impl eframe::App for Genesis {
                                         selected.as_deref(),
                                         "",
                                         show_prefixes,
+                                        double_click_to_open,
                                         groups_mode,
                                     )
                                 })
@@ -542,6 +623,7 @@ impl eframe::App for Genesis {
                                             selected.as_deref(),
                                             &filter,
                                             show_prefixes,
+                                            double_click_to_open,
                                             &mut status_update,
                                         )
                                     } else {
@@ -552,6 +634,7 @@ impl eframe::App for Genesis {
                                             selected.as_deref(),
                                             &filter,
                                             show_prefixes,
+                                            double_click_to_open,
                                             false,
                                         )
                                     }
@@ -577,6 +660,7 @@ impl eframe::App for Genesis {
                                             selected.as_deref(),
                                             &filter,
                                             show_prefixes,
+                                            double_click_to_open,
                                             true,
                                         )
                                     }
@@ -765,6 +849,7 @@ impl eframe::App for Genesis {
                         self.draw_field_search_bar(ui, &selected_key);
                     }
 
+                    let mut bitmap_reimport_request = None;
                     if let Some(doc) = self.parsed_tags.get_mut(&selected_key) {
                         let mut pending = Vec::new();
                         let mut block_ops = Vec::new();
@@ -772,6 +857,7 @@ impl eframe::App for Genesis {
                         let mut shader_param_ops = Vec::new();
                         let mut color_request = None;
                         let mut block_clip_request = None;
+                        let mut bitmap_reimport = None;
                         let field_filter = compute_pending_field_filter(
                             &doc.tag,
                             supports_field_search,
@@ -796,6 +882,7 @@ impl eframe::App for Genesis {
                             block_confirm: &mut self.block_confirm,
                             open_request: &mut self.pending_open,
                             tool_import: &mut self.pending_tool_import,
+                            bitmap_reimport: &mut bitmap_reimport,
                             shader_ops: &mut shader_ops,
                             shader_param_ops: &mut shader_param_ops,
                             color_request: &mut color_request,
@@ -867,10 +954,14 @@ impl eframe::App for Genesis {
                             );
                             self.block_clipboard = Some(clip);
                         }
+                        bitmap_reimport_request = bitmap_reimport;
                     } else if self.loading_tags.contains(&selected_key) {
                         ui.label("Loading tag data...");
                     } else {
                         ui.label("Select the tag again to load it.");
+                    }
+                    if let Some(key) = bitmap_reimport_request {
+                        self.begin_reimport_bitmap(key, ctx.clone());
                     }
                 } else {
                     ui.heading("No tag selected");
@@ -878,6 +969,7 @@ impl eframe::App for Genesis {
                 }
             });
         self.draw_settings_window(ctx);
+        self.draw_about_window(ctx);
         self.persist_prefs_if_changed();
         self.draw_floating_tabs(ctx);
         self.handle_floating_tab_drop(ctx);

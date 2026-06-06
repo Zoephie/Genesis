@@ -30,10 +30,10 @@ kits, detected from the kit's root folder name:
 | Halo 4 | `H4EK` | `halo4_mcc` |
 | Halo 2: Anniversary (MP) | `H2AMPEK` / `H2AEK` | `halo2amp_mcc` |
 
-Per-game group-name tables (`definitions/<game>/_meta.json`) are bundled with the
-project and embedded into the binary at compile time, so friendly tag-group
-names and reference resolution work regardless of where the executable is
-launched from.
+Per-game group-name tables (`blam-tags/definitions/<game>/_meta.json`) are
+provided by the submodule and embedded into the binary at compile time, so
+friendly tag-group names and reference resolution work regardless of where the
+executable is launched from.
 
 ---
 
@@ -244,12 +244,13 @@ Then build:
 cargo build --release
 ```
 
-The per-game definition tables under `definitions/` are embedded at compile
-time, so the binary resolves group names and references no matter where it is
-launched from. Geometry/animation/import-info extraction additionally relies on
-the companion `blam-tag-shell` binary. The root workspace builds Genesis and
-`blam-tag-shell` together, placing them side by side in `target/debug/` or
-`target/release/`. Ship both `Genesis.exe` and `blam-tag-shell.exe` in releases.
+The per-game definition tables under `blam-tags/definitions/` are embedded at
+compile time, so the binary resolves group names and references no matter where
+it is launched from. Geometry/animation/import-info extraction additionally
+relies on the companion `blam-tag-shell` binary. The root workspace builds
+Genesis and `blam-tag-shell` together, placing them side by side in
+`target/debug/` or `target/release/`. Ship both `Genesis.exe` and
+`blam-tag-shell.exe` in releases.
 
 ## Usage
 

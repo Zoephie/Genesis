@@ -30,6 +30,10 @@ pub(super) fn load_gui_prefs() -> GuiPrefs {
             .get("show_browser_prefixes")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        double_click_to_open_tags: value
+            .get("double_click_to_open_tags")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         expert_mode: value
             .get("expert_mode")
             .and_then(Value::as_bool)
@@ -63,6 +67,7 @@ pub(super) fn save_gui_prefs(
             BrowserMode::Groups => "groups",
         },
         "show_browser_prefixes": prefs.show_browser_prefixes,
+        "double_click_to_open_tags": prefs.double_click_to_open_tags,
         "expert_mode": prefs.expert_mode,
         "dark_mode": prefs.dark_mode,
         "blender_path": prefs.blender_path.as_ref().map(|path| path.display().to_string()),
