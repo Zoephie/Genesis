@@ -219,7 +219,7 @@ This crate depends on the `blam-tags` engine crate through a Git submodule
 pinned to the `back` branch of `https://github.com/Zoephie/blam-tags.git`.
 
 ```
-baboon/
+Baboon/
 ├── blam-tags/         <- Git submodule
 │   └── blam-tags/     <- the library crate
 └── src/
@@ -228,8 +228,8 @@ baboon/
 Clone with submodules:
 
 ```sh
-git clone --recurse-submodules <baboon-repo-url>
-cd baboon
+git clone --recurse-submodules <Baboon-repo-url>
+cd Baboon
 ```
 
 Or, after a normal clone:
