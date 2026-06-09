@@ -631,6 +631,7 @@ fn is_tags_folder(path: &Path) -> bool {
         .is_some_and(|name| name.eq_ignore_ascii_case("tags"))
 }
 
+#[cfg(test)]
 fn detect_ek_game(path: &Path) -> Option<&'static str> {
     detect_ek_root(path).map(|(_, game)| game)
 }
@@ -678,6 +679,7 @@ fn folder_source_label(
     label
 }
 
+#[cfg(test)]
 fn scan_folder_entries(root: &Path, names: &TagNameIndex) -> Result<Vec<TagEntry>> {
     let mut entries = Vec::new();
     for item in WalkDir::new(root).follow_links(false) {

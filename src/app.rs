@@ -14,9 +14,10 @@ use blam_tags::render_method::{
     RenderMethodParameterType, compile_real_constant,
 };
 use blam_tags::{
-    AssFile, Bitmap, ColorGraphType, Endian, FunctionFlags, FunctionType, JmsFile, StringIdData,
-    TagBlock, TagField, TagFieldData, TagFieldType, TagFile, TagFunction, TagReferenceData,
-    TagResource, TagResourceKind, TagStruct, format_group_tag, parse_group_tag,
+    AssFile, Bitmap, ColorGraphType, Endian, FunctionFlags, FunctionType, JmsFile, RenderModel,
+    RenderModelPreview, StringIdData, TagBlock, TagField, TagFieldData, TagFieldType, TagFile,
+    TagFunction, TagReferenceData, TagResource, TagResourceKind, TagStruct, format_group_tag,
+    parse_group_tag,
 };
 use eframe::egui::{
     self, Align2, Color32, FontData, FontDefinitions, FontFamily, FontId, Frame, RichText,
@@ -54,6 +55,10 @@ mod shader;
 use shader::*;
 mod material;
 use material::*;
+mod model_preview;
+use model_preview::*;
+mod map_names;
+use map_names::*;
 mod editor;
 use editor::*;
 mod controller;
@@ -72,6 +77,7 @@ pub struct Genesis {
     open_tabs: Vec<String>,
     floating_tabs: HashSet<String>,
     bitmap_previews: HashMap<String, BitmapPreviewState>,
+    model_previews: HashMap<String, ModelPreviewState>,
     edit_buffers: HashMap<String, String>,
     rmdf_cache: HashMap<String, Option<RenderMethodDefinition>>,
     rmop_cache: HashMap<String, Option<RenderMethodOption>>,
@@ -96,6 +102,8 @@ pub struct Genesis {
     saved_prefs: GuiPrefs,
     settings_open: bool,
     about_open: bool,
+    help_panel_tab: HelpPanelTab,
+    map_names_game_tab: MapNamesGameTab,
     blender_path: Option<PathBuf>,
     blender_path_input: String,
     color_popup: Option<MaterialColorPopup>,
@@ -152,6 +160,7 @@ impl Genesis {
             open_tabs: Vec::new(),
             floating_tabs: HashSet::new(),
             bitmap_previews: HashMap::new(),
+            model_previews: HashMap::new(),
             edit_buffers: HashMap::new(),
             rmdf_cache: HashMap::new(),
             rmop_cache: HashMap::new(),
@@ -168,6 +177,8 @@ impl Genesis {
             saved_prefs: prefs.clone(),
             settings_open: false,
             about_open: false,
+            help_panel_tab: HelpPanelTab::About,
+            map_names_game_tab: MapNamesGameTab::HaloCe,
             blender_path_input: prefs
                 .blender_path
                 .as_ref()

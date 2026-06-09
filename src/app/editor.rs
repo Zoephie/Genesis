@@ -22,6 +22,7 @@ pub(super) fn draw_tag(
     rmop_cache: &mut HashMap<String, Option<RenderMethodOption>>,
     color_popup: &mut Option<MaterialColorPopup>,
     function_popup: &mut Option<FunctionPopup>,
+    model_preview: &mut ModelPreviewState,
     expert_mode: bool,
     edit: &mut FieldEditContext<'_>,
 ) {
@@ -30,6 +31,7 @@ pub(super) fn draw_tag(
     if !is_object_family {
         draw_object_model_summary(ui, tag, entry, names, edit);
     }
+    draw_model_preview_panel(ui, tag, entry, names, source, model_preview);
     ui.add_space(6.0);
 
     let is_shaderish =

@@ -1301,6 +1301,7 @@ impl Genesis {
                             &mut edit_context,
                         );
                     } else {
+                        let model_preview = self.model_previews.entry(key.clone()).or_default();
                         draw_tag(
                             ui,
                             &doc.tag,
@@ -1311,6 +1312,7 @@ impl Genesis {
                             &mut self.rmop_cache,
                             &mut self.color_popup,
                             &mut self.function_popup,
+                            model_preview,
                             self.expert_mode,
                             &mut edit_context,
                         );

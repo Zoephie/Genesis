@@ -19,6 +19,7 @@ fn main() -> Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport,
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
 

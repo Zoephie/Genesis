@@ -143,31 +143,136 @@ impl Genesis {
         }
 
         let mut open = self.about_open;
-        egui::Window::new("About Genesis")
-            .id(egui::Id::new("about_genesis"))
+        egui::Window::new("Genesis Help")
+            .id(egui::Id::new("genesis_help"))
             .collapsible(false)
-            .resizable(false)
+            .resizable(true)
             .open(&mut open)
-            .default_width(420.0)
+            .default_width(780.0)
+            .default_height(560.0)
             .show(ctx, |ui| {
-                ui.heading(RichText::new("Genesis").color(text_dark()));
-                ui.label(
-                    RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION")))
-                        .color(subtle_dark()),
-                );
-                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.help_panel_tab, HelpPanelTab::About, "About");
+                    ui.selectable_value(&mut self.help_panel_tab, HelpPanelTab::Doc, "Doc");
+                    ui.selectable_value(
+                        &mut self.help_panel_tab,
+                        HelpPanelTab::MapNames,
+                        "Map Names",
+                    );
+                });
                 ui.separator();
                 ui.add_space(8.0);
-                ui.label(RichText::new("blam-tags created by Camden Smallwood").color(text_dark()));
-                ui.label(RichText::new("Genesis created by Zoephie Sinyard").color(text_dark()));
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(8.0);
-                ui.label(RichText::new("Source").color(text_dark()).strong());
-                ui.hyperlink_to(GENESIS_GITHUB_URL, GENESIS_GITHUB_URL);
+                match self.help_panel_tab {
+                    HelpPanelTab::About => draw_about_tab(ui),
+                    HelpPanelTab::Doc => draw_doc_tab(ui),
+                    HelpPanelTab::MapNames => draw_map_names_tab(ui, &mut self.map_names_game_tab),
+                }
             });
         self.about_open = open;
     }
+}
+
+fn draw_about_tab(ui: &mut Ui) {
+    ui.heading(RichText::new("Genesis").color(text_dark()));
+    ui.label(RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).color(subtle_dark()));
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("blam-tags created by").color(text_dark()));
+        ui.label(
+            RichText::new("Camden Smallwood")
+                .color(foundation_blue())
+                .strong(),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Genesis created by").color(text_dark()));
+        ui.label(
+            RichText::new("Zoephie Sinyard")
+                .color(foundation_blue())
+                .strong(),
+        );
+    });
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(8.0);
+    ui.label(RichText::new("Source").color(text_dark()).strong());
+    ui.hyperlink_to(GENESIS_GITHUB_URL, GENESIS_GITHUB_URL);
+}
+
+fn draw_doc_tab(ui: &mut Ui) {
+    ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            doc_section(
+                ui,
+                "Load Folder",
+                &[
+                    "Use File > Load Folder to choose the root of your editing kit, such as H3EK, HREK, H4EK, H3ODSTEK, or H2AMPEK/H2AEK.",
+                    "Genesis will load the kit's tags folder from that root. Picking the kit root also lets the terminal, launcher buttons, and tool import commands resolve the correct working directory.",
+                    "Choosing the tags folder directly works for browsing tags, but the kit root is the safest habit when you want Genesis to work with external tools.",
+                ],
+            );
+            doc_section(
+                ui,
+                "Tag Browser Context Menus",
+                &[
+                    "Right-click tags in the browser to open actions for that tag.",
+                    "Render models, models, scenarios, BSPs, collision models, and physics models can expose geometry extraction actions from this menu.",
+                    "Model animation graph tags can expose animation extraction actions from this menu.",
+                    "Bitmap tags can extract bitmap images, and monolithic cache entries can extract raw tag files.",
+                ],
+            );
+            doc_section(
+                ui,
+                "Block Context Menus",
+                &[
+                    "Right-click a block name in the editor header to copy and paste block data.",
+                    "Copy element copies the selected block entry. Copy entire block copies every entry in that block.",
+                    "Paste, Replace selected element, and Replace entire block appear when the clipboard is compatible with the current tag group and block path.",
+                ],
+            );
+            doc_section(
+                ui,
+                "Moving Through Blocks",
+                &[
+                    "Click or focus a block's element selector, then use the mouse wheel to move up and down through entries.",
+                    "Arrow Up and Arrow Down also move through the selected block entries.",
+                    "The < and > buttons beside the selector do the same one-entry step when you prefer clicking.",
+                ],
+            );
+            doc_section(
+                ui,
+                "Import Buttons",
+                &[
+                    "Tag-reference rows for render_model, collision_model, physics_model, and model_animation_graph can show an Import button.",
+                    "Import runs the matching editing-kit tool command from the kit root, so it needs a loaded editing-kit folder.",
+                    "For animation graphs, Genesis uses the model-animations-uncompressed tool command.",
+                ],
+            );
+        });
+}
+
+fn doc_section(ui: &mut Ui, title: &str, lines: &[&str]) {
+    ui.label(
+        RichText::new(title)
+            .color(foundation_blue())
+            .font(FontId::proportional(14.0))
+            .strong(),
+    );
+    ui.add_space(4.0);
+    for line in lines {
+        ui.horizontal_top(|ui| {
+            ui.label(RichText::new("-").color(subtle_dark()));
+            ui.add(
+                egui::Label::new(RichText::new(*line).color(text_dark()))
+                    .wrap()
+                    .selectable(false),
+            );
+        });
+    }
+    ui.add_space(12.0);
 }
 
 impl eframe::App for Genesis {
@@ -285,6 +390,17 @@ impl eframe::App for Genesis {
                     });
                     ui.menu_button("Help", |ui| {
                         if ui.button("About...").clicked() {
+                            self.help_panel_tab = HelpPanelTab::About;
+                            self.about_open = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("Doc...").clicked() {
+                            self.help_panel_tab = HelpPanelTab::Doc;
+                            self.about_open = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("Map Names...").clicked() {
+                            self.help_panel_tab = HelpPanelTab::MapNames;
                             self.about_open = true;
                             ui.close_menu();
                         }
@@ -907,6 +1023,8 @@ impl eframe::App for Genesis {
                                 &mut edit_context,
                             );
                         } else {
+                            let model_preview =
+                                self.model_previews.entry(selected_key.clone()).or_default();
                             draw_tag(
                                 ui,
                                 &doc.tag,
@@ -917,6 +1035,7 @@ impl eframe::App for Genesis {
                                 &mut self.rmop_cache,
                                 &mut self.color_popup,
                                 &mut self.function_popup,
+                                model_preview,
                                 self.expert_mode,
                                 &mut edit_context,
                             );

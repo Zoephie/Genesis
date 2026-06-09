@@ -56,6 +56,13 @@ pub(super) enum BrowserMode {
     Groups,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum HelpPanelTab {
+    About,
+    Doc,
+    MapNames,
+}
+
 /// Memoized search results for the tag browser.
 ///
 /// Filtering the full tag set (100k+ entries) and lowercasing each name is far
@@ -421,4 +428,74 @@ pub(super) struct BitmapPreviewData {
     pub(super) format_name: String,
     pub(super) type_name: String,
     pub(super) rgba: Vec<u8>,
+}
+
+pub(super) struct ModelPreviewState {
+    pub(super) loaded_key: Option<String>,
+    pub(super) render_model_path: Option<String>,
+    pub(super) data: Option<Result<ModelPreviewData, String>>,
+    pub(super) selected_variant: Option<usize>,
+    pub(super) region_selections: HashMap<String, ModelRegionSelection>,
+    pub(super) projected_triangles: Vec<ModelProjectedTriangle>,
+    pub(super) show_markers: bool,
+    pub(super) show_wireframe: bool,
+    pub(super) show_backfaces: bool,
+    pub(super) scale: f32,
+    pub(super) yaw: f32,
+    pub(super) pitch: f32,
+    pub(super) pan: Vec2,
+}
+
+impl Default for ModelPreviewState {
+    fn default() -> Self {
+        Self {
+            loaded_key: None,
+            render_model_path: None,
+            data: None,
+            selected_variant: None,
+            region_selections: HashMap::new(),
+            projected_triangles: Vec::new(),
+            show_markers: false,
+            show_wireframe: false,
+            show_backfaces: false,
+            scale: 1.0,
+            yaw: -0.45,
+            pitch: 0.25,
+            pan: Vec2::ZERO,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct ModelRegionSelection {
+    pub(super) enabled: bool,
+    pub(super) permutation: String,
+}
+
+#[derive(Clone)]
+pub(super) struct ModelPreviewData {
+    pub(super) source_key: String,
+    pub(super) render_model_path: String,
+    pub(super) preview: RenderModelPreview,
+    pub(super) draw_triangles: Vec<ModelSourceTriangle>,
+    pub(super) variants: Vec<ModelVariantPreview>,
+}
+
+#[derive(Clone)]
+pub(super) struct ModelVariantPreview {
+    pub(super) name: String,
+    pub(super) regions: HashMap<String, String>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ModelSourceTriangle {
+    pub(super) batch_index: usize,
+    pub(super) positions: [[f32; 3]; 3],
+    pub(super) fill: Color32,
+}
+
+pub(super) struct ModelProjectedTriangle {
+    pub(super) points: [egui::Pos2; 3],
+    pub(super) depth: f32,
+    pub(super) fill: Color32,
 }
